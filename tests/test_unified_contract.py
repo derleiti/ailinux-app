@@ -70,6 +70,11 @@ class UnifiedAppContractTests(unittest.TestCase):
         self.assertEqual(package["build"]["win"]["icon"], "../../assets/desktop/ailinux-app.ico")
         self.assertEqual(package["build"]["mac"]["icon"], "../../assets/desktop/ailinux-app-macos-1024.png")
         self.assertTrue((ROOT / "run-source.sh").is_file())
+        run_source = (ROOT / "run-source.sh").read_text()
+        setup_source = (ROOT / "scripts/setup-source.sh").read_text()
+        self.assertIn('$ROOT/.venv/bin/python', run_source)
+        self.assertIn('python3 -m venv', setup_source)
+        self.assertIn('pip install -e "$ROOT/core/aicoder"', setup_source)
 
     def test_network_contract_uses_existing_triforce_fabric(self) -> None:
         network = json.loads((ROOT / "shared/contracts/app-network.json").read_text())
