@@ -1,6 +1,6 @@
 # AILinux App
 
-**3.0.0 alpha 1** — the unified AILinux client built from **AICoder + AILinux Helper**.
+**3.0.0 alpha 2** — the unified AILinux client built from **AICoder + AILinux Helper**.
 
 One installation combines AI/coding, authenticated AILinux access, the `@handle` AI network, MCP/workspace sharing and device capabilities across Android, Linux, Windows and macOS.
 

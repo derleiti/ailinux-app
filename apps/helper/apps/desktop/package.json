@@ -1,6 +1,6 @@
 {
   "name": "@ailinux/app-desktop",
-  "version": "3.0.0-alpha.1",
+  "version": "3.0.0-alpha.2",
   "private": true,
   "description": "Unified AILinux App: AICoder + Helper capability host for Linux, Windows and macOS",
   "main": "main.js",
