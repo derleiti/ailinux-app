@@ -57,7 +57,7 @@ Import provenance is recorded in `docs/MERGE_BASELINE.md`; the initial import us
 The source checkout can be launched directly from the user home directory:
 
 ```bash
-cd /home/zombie/ailinux-app
+cd /home/zombie/workspace/ailinux-app
 ./run-source.sh
 ```
 

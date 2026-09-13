@@ -62,7 +62,7 @@ class UnifiedAppContractTests(unittest.TestCase):
     def test_linux_source_launcher_and_assets(self) -> None:
         launcher = (ROOT / "apps/helper/assets/desktop/ailinux-app.desktop").read_text()
         package = json.loads((DESKTOP / "package.json").read_text())
-        self.assertIn("Exec=/home/zombie/ailinux-app/run-source.sh", launcher)
+        self.assertIn("Exec=/home/zombie/workspace/ailinux-app/run-source.sh", launcher)
         self.assertIn("Icon=ailinux-app", launcher)
         self.assertIn("Actions=Terminal;Folder;GitHub;", launcher)
         for name in ("ailinux-app.png", "ailinux-app.ico", "ailinux-app-macos-1024.png", "ailinux-app.svg"):
