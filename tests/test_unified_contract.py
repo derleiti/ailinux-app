@@ -58,6 +58,19 @@ class UnifiedAppContractTests(unittest.TestCase):
         self.assertIn("Open AICoder", main)
         self.assertIn("aicoder-sidecar", runtime)
 
+    def test_linux_source_launcher_and_assets(self) -> None:
+        launcher = (ROOT / "apps/helper/assets/desktop/ailinux-app.desktop").read_text()
+        package = json.loads((DESKTOP / "package.json").read_text())
+        self.assertIn("Exec=/home/zombie/ailinux-app/run-source.sh", launcher)
+        self.assertIn("Icon=ailinux-app", launcher)
+        self.assertIn("Actions=Terminal;Folder;GitHub;", launcher)
+        for name in ("ailinux-app.png", "ailinux-app.ico", "ailinux-app-macos-1024.png", "ailinux-app.svg"):
+            self.assertTrue((ROOT / "apps/helper/assets/desktop" / name).is_file(), name)
+        self.assertEqual(package["build"]["linux"]["icon"], "../../assets/desktop/ailinux-app.png")
+        self.assertEqual(package["build"]["win"]["icon"], "../../assets/desktop/ailinux-app.ico")
+        self.assertEqual(package["build"]["mac"]["icon"], "../../assets/desktop/ailinux-app-macos-1024.png")
+        self.assertTrue((ROOT / "run-source.sh").is_file())
+
     def test_network_contract_uses_existing_triforce_fabric(self) -> None:
         network = json.loads((ROOT / "shared/contracts/app-network.json").read_text())
         self.assertEqual(network["api"]["network"], "/v1/notify-network")

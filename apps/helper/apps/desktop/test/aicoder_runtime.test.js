@@ -13,3 +13,11 @@ test('desktop source declares bundled AICoder runtime bridge', () => {
   assert.equal(pkg.productName, 'AILinux App');
   assert.ok(pkg.build.extraResources.some((row) => row.to === 'aicoder'));
 });
+
+test('source checkout falls back to the imported AICoder Python runtime', () => {
+  const runtime = fs.readFileSync(path.join(__dirname, '..', 'aicoder_runtime.js'), 'utf8');
+  assert.match(runtime, /function sourceRuntime\(\)/);
+  assert.match(runtime, /aicoder_main\.py/);
+  assert.match(runtime, /AILINUX_APP_PYTHON/);
+  assert.match(runtime, /mode: file \? 'sidecar' : source \? 'source'/);
+});

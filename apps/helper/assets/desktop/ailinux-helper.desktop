@@ -1,10 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=AILinux Helper
-Comment=Persistent local AILinux device helper
-Exec=ailinux-helper %U
-Icon=ailinux-helper
+Version=1.5
+Name=AILinux App
+GenericName=AI Coding and Capability Client
+Comment=AICoder + Helper + AI Network
+Exec=ailinux-app %U
+Icon=ailinux-app
 Terminal=false
-Categories=Development;Utility;
+Categories=Development;
 StartupNotify=true
 MimeType=x-scheme-handler/ailinux-helper;x-scheme-handler/ailinux-workspace;

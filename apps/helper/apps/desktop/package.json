@@ -52,7 +52,7 @@
       "category": "Development",
       "synopsis": "AILinux unified AI, coding and device capability app",
       "maintainer": "AILinux <admin@ailinux.me>",
-      "icon": "../../assets/desktop/icon.png",
+      "icon": "../../assets/desktop/ailinux-app.png",
       "syncDesktopName": true
     },
     "deb": {
@@ -63,7 +63,7 @@
         "nsis",
         "portable"
       ],
-      "icon": "../../assets/desktop/icon.ico"
+      "icon": "../../assets/desktop/ailinux-app.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -77,11 +77,11 @@
         "zip"
       ],
       "category": "public.app-category.developer-tools",
-      "icon": "../../assets/desktop/icon-macos-1024.png"
+      "icon": "../../assets/desktop/ailinux-app-macos-1024.png"
     },
     "extraResources": [
       {
-        "from": "../../assets/desktop/icon.png",
+        "from": "../../assets/desktop/ailinux-app.png",
         "to": "icon.png"
       },
       {

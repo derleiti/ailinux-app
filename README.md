@@ -51,6 +51,17 @@ tests/                        merge/integration contracts
 
 Import provenance is recorded in `docs/MERGE_BASELINE.md`; the initial import used remote Git trees rather than dirty local working copies.
 
+## Start from source on Linux
+
+The source checkout can be launched directly from the user home directory:
+
+```bash
+cd /home/zombie/ailinux-app
+./run-source.sh
+```
+
+`./run-source.sh --check` validates the local Python/Electron runtime. The installed KDE/Plasma launcher uses the same source entry point and includes actions for the source terminal, source folder and GitHub repository. In source mode the Electron capability host launches `core/aicoder/aicoder_main.py` directly when no packaged AICoder sidecar is present.
+
 ## Local verification
 
 ```bash

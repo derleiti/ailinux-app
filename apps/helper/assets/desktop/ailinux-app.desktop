@@ -1,0 +1,31 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=AILinux App
+GenericName=AI Coding and Capability Client
+Comment=AICoder + Helper + AI Network
+Exec=/home/zombie/ailinux-app/run-source.sh
+Path=/home/zombie/ailinux-app
+Icon=ailinux-app
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=AILinux App
+MimeType=x-scheme-handler/ailinux-helper;x-scheme-handler/ailinux-workspace;
+Actions=Terminal;Folder;GitHub;
+Keywords=AI;AICoder;MCP;Workspace;TriForce;Helper;
+
+[Desktop Action Terminal]
+Name=Open Source Terminal
+Exec=/home/zombie/ailinux-app/scripts/open-source-terminal.sh
+Icon=utilities-terminal
+
+[Desktop Action Folder]
+Name=Open Source Folder
+Exec=/home/zombie/ailinux-app/scripts/open-source-folder.sh
+Icon=folder-development
+
+[Desktop Action GitHub]
+Name=Open GitHub Repository
+Exec=xdg-open https://github.com/derleiti/ailinux-app
+Icon=internet-web-browser
