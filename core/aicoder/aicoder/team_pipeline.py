@@ -1,0 +1,353 @@
+"""Deterministic stage gates and project-aware verification for team runs."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from typing import Any, Iterable
+
+from .task_contract import AcceptanceCheck, TaskContract, compile_task_contract
+
+
+class TeamStage(str, Enum):
+    PLAN_RESEARCH = "plan_research"
+    RESEARCH = "research"
+    BRAINSTORM = "brainstorm"
+    PLAN_CODE = "plan_code"
+    CODE = "code"
+    MERGE_PLAN = "merge_plan"
+    MERGE = "merge"
+    PLAN_TESTS = "plan_tests"
+    TESTS_FUNCTION_OK = "tests_function_ok"
+    ATOMIC_DISK_WRITE = "atomic_disk_write"
+
+
+STAGE_ORDER = tuple(TeamStage)
+
+
+@dataclass
+class StageLedger:
+    """Append-only in-memory stage ledger; persistence happens only through RAM artifacts."""
+    completed: list[str] = field(default_factory=list)
+    current: str = ""
+
+    def start(self, stage: TeamStage) -> None:
+        expected = STAGE_ORDER[len(self.completed)] if len(self.completed) < len(STAGE_ORDER) else None
+        if expected != stage:
+            raise RuntimeError(f"invalid team stage transition: expected {expected}, got {stage}")
+        self.current = stage.value
+
+    def complete(self, stage: TeamStage) -> None:
+        if self.current != stage.value:
+            raise RuntimeError(f"cannot complete inactive stage {stage.value}")
+        self.completed.append(stage.value)
+        self.current = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"completed": list(self.completed), "current": self.current}
+
+
+@dataclass(frozen=True)
+class VerificationCommand:
+    name: str
+    argv: tuple[str, ...]
+    timeout: int = 180
+    required: bool = True
+    expected_exit_codes: tuple[int, ...] = (0,)
+    expected_nonzero: bool = False
+
+
+@dataclass
+class VerificationResult:
+    name: str
+    argv: list[str]
+    ok: bool
+    exit_code: int
+    elapsed_ms: int
+    output: str
+    required: bool = True
+    expected_exit_codes: tuple[int, ...] = (0,)
+    expected_nonzero: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name, "argv": self.argv, "ok": self.ok,
+            "exit_code": self.exit_code, "elapsed_ms": self.elapsed_ms,
+            "output": self.output, "required": self.required,
+            "expected_exit_codes": list(self.expected_exit_codes), "expected_nonzero": self.expected_nonzero,
+        }
+
+
+def configured_project_python(root: str | Path) -> str | None:
+    """Return an explicitly configured or project-local Python test interpreter.
+
+    ``AICODER_TEST_PYTHON`` is intentionally process-scoped so a CI/dev runner
+    can provide the dependency-complete interpreter without persisting host paths
+    into project state. Project-local virtual environments remain automatic.
+    """
+    root = Path(root).expanduser().resolve(strict=False)
+    candidates: list[Path] = []
+    override = str(os.environ.get("AICODER_TEST_PYTHON") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    if os.name == "nt":
+        candidates.extend([root / ".venv" / "Scripts" / "python.exe", root / "venv" / "Scripts" / "python.exe"])
+    else:
+        candidates.extend([root / ".venv" / "bin" / "python", root / "venv" / "bin" / "python"])
+    for candidate in candidates:
+        # Do not resolve virtual-environment interpreter symlinks. Executing the
+        # resolved /usr/bin/python target discards pyvenv.cfg discovery and can
+        # silently lose project/AICoder dependencies such as pytest.
+        expanded = candidate.expanduser()
+        path = expanded if expanded.is_absolute() else (Path.cwd() / expanded)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.absolute())
+
+    # When AICoder itself runs from a virtual environment, its interpreter is
+    # the dependency-complete runtime already used by the native test tool.
+    # Keep the venv path (including its symlink) so Python sees pyvenv.cfg.
+    if getattr(sys, "prefix", "") != getattr(sys, "base_prefix", ""):
+        current = Path(sys.executable)
+        if current.is_file() and os.access(current, os.X_OK):
+            return str(current.absolute())
+    return None
+
+
+def project_python_interpreter(root: str | Path) -> str:
+    """Interpreter used by deterministic Python project checks."""
+    return configured_project_python(root) or "python3"
+
+
+def normalize_project_test_argv(argv: list[str], root: str | Path) -> list[str]:
+    """Route Python test commands through the configured project interpreter.
+
+    Non-Python test runners and unconfigured environments are preserved exactly.
+    """
+    configured = configured_project_python(root)
+    if not configured or not argv:
+        return list(argv)
+    executable = Path(argv[0]).name.lower()
+    if executable in {"pytest", "py.test"}:
+        return [configured, "-m", "pytest", *argv[1:]]
+    if executable in {"python", "python3", "python.exe"} and len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pytest", "unittest"}:
+        return [configured, *argv[1:]]
+    return list(argv)
+
+
+_TEST_DIR_NAMES = {"test", "tests", "spec", "specs", "__tests__"}
+_SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".kts", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala", ".sh"}
+
+def _is_test_path(path: str) -> bool:
+    p = Path(path)
+    parts = {part.lower() for part in p.parts}
+    name = p.name.lower(); stem = p.stem.lower()
+    return bool(parts & _TEST_DIR_NAMES or name.startswith("test_") or stem.endswith("_test") or ".test." in name or ".spec." in name)
+
+def test_change_evidence(delta: dict[str, Any]) -> dict[str, Any]:
+    changed = [str(path) for path in (delta.get("changed") or [])]
+    deleted = [str(path) for path in (delta.get("deleted") or [])]
+    paths = sorted(set(changed + deleted))
+    test_paths = [path for path in paths if _is_test_path(path)]
+    source_paths = [path for path in paths if not _is_test_path(path) and Path(path).suffix.lower() in _SOURCE_SUFFIXES]
+    deleted_test_paths = [path for path in deleted if _is_test_path(path)]
+    added_test_paths = [path for path in (delta.get("added_files") or delta.get("added") or []) if _is_test_path(str(path))]
+    tests_weakened = bool(deleted_test_paths) and not bool(added_test_paths)
+    return {
+        "source_paths": source_paths, "test_paths": test_paths,
+        "added_test_paths": sorted(map(str, added_test_paths)),
+        "deleted_test_paths": sorted(deleted_test_paths),
+        "behavior_change": bool(source_paths), "tests_changed": bool(test_paths),
+        "tests_weakened": tests_weakened,
+        "coverage_evidence_ok": ((not source_paths) or bool(test_paths)) and not tests_weakened,
+    }
+
+_SHELL_META_RE = __import__("re").compile(r"(?:&&|\|\||[|;<>`]|\$\(|\n|\r)")
+
+_ACCEPTANCE_EXECUTABLES = {
+    "python", "python3", "python.exe", "pytest", "py.test",
+    "npm", "pnpm", "yarn", "cargo", "go", "cmake", "make",
+    "ctest", "meson", "ninja", "dotnet", "mvn", "gradle", "gradlew",
+    "bash", "sh", "grep", "rg",
+}
+def task_acceptance_verification_plan(task: str | TaskContract, root: str | Path) -> list[VerificationCommand]:
+    """Convert task-contract acceptance commands into safe executable verification gates."""
+    root = Path(root)
+    contract = task if isinstance(task, TaskContract) else compile_task_contract(str(task or ""))
+    commands: list[VerificationCommand] = []
+    checks = contract.acceptance_checks or tuple(AcceptanceCheck(c) for c in contract.acceptance_commands)
+    for check in checks:
+        command_text = str(check.command or "").strip().strip("`")
+        if _SHELL_META_RE.search(command_text):
+            continue
+        try:
+            argv = shlex.split(command_text)
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        executable = Path(argv[0]).name.lower()
+        if executable not in _ACCEPTANCE_EXECUTABLES:
+            continue
+        argv = normalize_project_test_argv(argv, root)
+        if Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
+            argv[0] = project_python_interpreter(root)
+        commands.append(VerificationCommand(f"task-acceptance-{len(commands)+1}", tuple(argv), 300, True, tuple(check.expected_exit_codes), bool(check.expected_nonzero)))
+    return commands
+
+
+def merge_verification_plans(*plans: Iterable[VerificationCommand]) -> list[VerificationCommand]:
+    """Combine verification plans while preserving order and removing exact argv duplicates."""
+    merged: list[VerificationCommand] = []
+    seen: set[tuple[str, ...]] = set()
+    for plan in plans:
+        for command in plan:
+            key = tuple(command.argv)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(command)
+    return merged
+
+
+def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
+    """Infer deterministic checks from repository-native metadata, without an LLM vote."""
+    root = Path(root)
+    commands: list[VerificationCommand] = []
+    python = project_python_interpreter(root)
+
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "setup.cfg").exists():
+        commands.append(VerificationCommand("python-compile", (python, "-m", "compileall", "-q", "."), 120))
+        if (root / "tests").is_dir():
+            pyproject_text = ""
+            if (root / "pyproject.toml").exists():
+                pyproject_text = (root / "pyproject.toml").read_text(encoding="utf-8", errors="ignore")
+            uses_pytest = (
+                (root / "pytest.ini").exists()
+                or (root / "conftest.py").exists()
+                or "pytest" in pyproject_text.lower()
+            )
+            if uses_pytest:
+                commands.append(VerificationCommand("python-tests", (python, "-m", "pytest", "-q"), 300))
+            else:
+                commands.append(VerificationCommand("python-tests", (python, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"), 300))
+        if (root / "ruff.toml").exists() or (root / ".ruff.toml").exists():
+            commands.append(VerificationCommand("ruff", (python, "-m", "ruff", "check", "."), 180))
+        if (root / "mypy.ini").exists() or (root / ".mypy.ini").exists():
+            commands.append(VerificationCommand("mypy", (python, "-m", "mypy", "."), 240))
+
+    if (root / "package.json").exists():
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+            scripts = package.get("scripts") if isinstance(package, dict) else {}
+        except Exception:
+            scripts = {}
+        runner = "npm"
+        if (root / "pnpm-lock.yaml").exists(): runner = "pnpm"
+        elif (root / "yarn.lock").exists(): runner = "yarn"
+        for script, label in (("test", "js-tests"), ("lint", "js-lint"), ("typecheck", "js-typecheck"), ("build", "js-build")):
+            if isinstance(scripts, dict) and script in scripts:
+                argv = (runner, script) if runner != "npm" else ("npm", "run", script)
+                commands.append(VerificationCommand(label, argv, 300))
+
+    if (root / "Cargo.toml").exists():
+        commands.extend([
+            VerificationCommand("cargo-check", ("cargo", "check", "--all-targets"), 300),
+            VerificationCommand("cargo-test", ("cargo", "test", "--all-targets"), 300),
+        ])
+    if (root / "go.mod").exists():
+        commands.append(VerificationCommand("go-test", ("go", "test", "./..."), 300))
+    if (root / "CMakeLists.txt").exists():
+        commands.extend([
+            VerificationCommand("cmake-configure", ("cmake", "-S", ".", "-B", ".aicoder-build"), 240),
+            VerificationCommand("cmake-build", ("cmake", "--build", ".aicoder-build", "-j2"), 300),
+        ])
+    if (root / "Makefile").exists() and not commands:
+        commands.append(VerificationCommand("make", ("make", "-j2"), 300))
+
+    # A project with no known metadata still gets a deterministic sanity gate.
+    # Git-backed projects can use git's whitespace/error check. Fresh non-Git
+    # projects must not fail merely because their parent projects container is
+    # not a repository.
+    if not commands:
+        if (root / ".git").exists():
+            commands.append(VerificationCommand("git-diff-check", ("git", "diff", "--check"), 60))
+        else:
+            script = (
+                "from pathlib import Path; import sys; "
+                "sys.exit(0 if any(p.is_file() for p in Path('.').rglob('*')) else 1)"
+            )
+            commands.append(VerificationCommand("workspace-content", (python, "-c", script), 60))
+    return commands
+
+
+def execute_verification_plan(root: str | Path, commands: Iterable[VerificationCommand]) -> list[VerificationResult]:
+    root = Path(root)
+    results: list[VerificationResult] = []
+    # Candidate verification can run repeatedly within the same second after a
+    # same-size Python edit. CPython's timestamp/size pyc invalidation can then
+    # reuse stale bytecode from an earlier verification turn. Redirect bytecode
+    # to a fresh cache tree for every deterministic verification pass so checks
+    # always execute the current candidate files without mutating project caches.
+    with tempfile.TemporaryDirectory(prefix="aicoder-verify-pycache-") as pycache_dir:
+        verification_env = os.environ.copy()
+        verification_env["PYTHONPYCACHEPREFIX"] = pycache_dir
+        for command in commands:
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    list(command.argv), cwd=str(root), capture_output=True, text=True,
+                    timeout=command.timeout, env=verification_env,
+                )
+                results.append(VerificationResult(
+                    command.name, list(command.argv), (proc.returncode != 0 if command.expected_nonzero else proc.returncode in command.expected_exit_codes), proc.returncode,
+                    int((time.monotonic() - started) * 1000), (proc.stdout + "\n" + proc.stderr)[-12000:], command.required, command.expected_exit_codes, command.expected_nonzero,
+                ))
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append(VerificationResult(
+                    command.name, list(command.argv), False, -1, int((time.monotonic() - started) * 1000),
+                    f"{type(exc).__name__}: {exc}", command.required, command.expected_exit_codes, command.expected_nonzero,
+                ))
+    return results
+
+
+def verification_passed(results: Iterable[VerificationResult]) -> bool:
+    rows = list(results)
+    return bool(rows) and all(row.ok for row in rows if row.required)
+
+
+def content_fingerprint(diff_text: str) -> str:
+    return hashlib.sha256(str(diff_text).encode("utf-8", errors="replace")).hexdigest()
+
+
+def blind_candidate_id(diff_text: str = "") -> str:
+    """Return a random model-neutral candidate run id.
+
+    Content identity is tracked separately via ``content_fingerprint`` so two
+    identical or empty diffs never collide at the filesystem/logging layer.
+    """
+    token = hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:12]
+    return "cand-" + token
+
+
+def objective_rank_key(evaluation: dict[str, Any]) -> tuple:
+    """Model/slot-independent ranking. Higher tuple wins; hash is deterministic tiebreak."""
+    checks = evaluation.get("checks") or {}
+    required = list(checks.values())
+    passed = sum(1 for item in required if bool(item.get("ok")))
+    failed = sum(1 for item in required if not bool(item.get("ok")))
+    delta = evaluation.get("delta") or {}
+    churn = int(delta.get("changed_count", 0)) + int(delta.get("deleted_count", 0))
+    score = int(evaluation.get("score") or 0)
+    fingerprint = content_fingerprint(str(evaluation.get("diff") or ""))
+    # Prefer: zero failures, more passing gates, higher objective score, then less churn.
+    # Final hash tie-break avoids slot/model order bias while remaining reproducible.
+    return (-failed, passed, score, -churn, fingerprint)

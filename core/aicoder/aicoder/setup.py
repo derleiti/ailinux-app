@@ -1,0 +1,1171 @@
+from __future__ import annotations
+"""
+setup.py — Setup-Wizard + Agent-REPL.
+
+Wird gestartet wenn:
+  - `aicoder` ohne Argumente aufgerufen wird
+  - Kein Modell in state.json konfiguriert ist  (Setup-Mode)
+  - Modell gesetzt → direkt Agent-REPL starten  (Agent-Mode)
+"""
+
+import json
+import os
+import sys
+from getpass import getpass
+from pathlib import Path
+from typing import Optional
+
+from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
+from .session_state import (
+    SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, get_state,
+    set_approval_mode, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
+)
+from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
+from .workspace import active_workspace
+from .repl_input import COMMANDS, PromptCancelled, ReplInput
+from . import settings as settings_core
+
+
+
+def _is_token_expired(token: str) -> bool:
+    """Check JWT expiry using correct urlsafe base64 padding."""
+    try:
+        from .client import _decode_jwt_exp
+        exp = _decode_jwt_exp(token)
+        if exp is None: return False
+        import time
+        return exp < time.time()
+    except Exception:
+        return False
+
+
+def _ensure_valid_session() -> bool:
+    """Return whether the stored session can still be used.
+
+    Re-authentication belongs to ``run_setup`` so there is only one login
+    path for CLI, REPL and first-run setup.
+    """
+    try:
+        session = load_session()
+        if not _is_token_expired(session.token):
+            return True
+        print("  \033[33mSession abgelaufen — Login erforderlich\033[0m")
+        return False
+    except Exception:
+        return False
+
+
+# ── Interaktiver Model-Picker ──────────────────────────────────────────────
+PROVIDER_ORDER = ["anthropic","gemini","mistral","groq","cerebras",
+                  "openrouter","cloudflare","github","ollama","other"]
+
+def _read_key() -> str:
+    import platform
+    if platform.system() == "Windows":
+        try:
+            import msvcrt
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                ch2 = msvcrt.getwch()
+                return {"H":"UP","P":"DOWN","M":"RIGHT","K":"LEFT"}.get(ch2, "?")
+            return "\n" if ch == "\r" else ("q" if ch == "\x03" else ch)
+        except Exception:
+            return input() or "\n"
+    else:
+        try:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.buffer.read(1)
+                if ch == b"\x1b":
+                    ch2 = sys.stdin.buffer.read(1)
+                    if ch2 == b"[":
+                        ch3 = sys.stdin.buffer.read(1)
+                        return {b"A":"UP",b"B":"DOWN",b"C":"RIGHT",b"D":"LEFT"}.get(ch3,"?")
+                    return "ESC"
+                return ch.decode("utf-8", errors="replace")
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            return input() or "\n"
+
+
+def _group_models(models: list) -> dict:
+    groups: dict = {}
+    for m in models:
+        if m.get("media_image") or m.get("media_video"):
+            continue
+        p = m.get("provider", "other")
+        groups.setdefault(p, []).append(m)
+    ordered = {}
+    for p in PROVIDER_ORDER:
+        if p in groups:
+            ordered[p] = groups[p]
+    for p in groups:
+        if p not in ordered:
+            ordered[p] = groups[p]
+    return ordered
+
+
+def model_picker_interactive(current_model: str = "") -> str:
+    """TUI Model-Picker: ←→ Provider, ↑↓ Modell, Enter=OK, q=Abbruch."""
+    try:
+        from .config import load_session
+        from .client import TriForceClient
+        session = load_session()
+        all_models = TriForceClient(session.base_url, session.token).list_models()
+    except Exception:
+        all_models = []
+
+    if not all_models:
+        val = input(f"  Modell-ID [{current_model}]: ").strip()
+        return val or current_model
+
+    groups = _group_models(all_models)
+    providers = list(groups.keys())
+    if not providers:
+        return current_model
+
+    cur_prov, cur_mod = 0, 0
+    for pi, p in enumerate(providers):
+        for mi, m in enumerate(groups[p]):
+            if m.get("id", m.get("model", "")) == current_model:
+                cur_prov, cur_mod = pi, mi
+
+    VISIBLE = 12
+
+    def _cls():
+        os.system("cls" if os.name == "nt" else "clear")
+
+    def _render(pi, mi):
+        _cls()
+        mods = groups[providers[pi]]
+        bar = ""
+        for i, p in enumerate(providers):
+            cnt = len(groups[p])
+            bar += (f"\033[1;36m[ {p} ({cnt}) ]\033[0m " if i == pi
+                    else f"\033[2m{p} ({cnt})\033[0m  ")
+        print(f"\n  {bar}")
+        try:
+            w = min(os.get_terminal_size().columns - 4, 96)
+        except Exception:
+            w = 76
+        print(f"  \033[2m{'─'*w}\033[0m")
+        print(f"  \033[2m← → Provider  ↑ ↓ Modell  Enter=OK  q=Abbruch\033[0m")
+        print(f"  \033[2m{'─'*w}\033[0m")
+        total = len(mods)
+        start = max(0, min(mi - VISIBLE//2, total - VISIBLE))
+        for i in range(start, min(start + VISIBLE, total)):
+            m = mods[i]
+            mid = m.get("id", m.get("model", ""))
+            name = m.get("name", mid)
+            caps = " ".join(f"\033[2m[{c}]\033[0m" for c in m.get("capabilities",[]) if c != "chat")
+            if i == mi:
+                print(f"  \033[1;32m▶ {name:<55}\033[0m {caps}")
+            else:
+                print(f"    \033[2m{name:<55}\033[0m {caps}")
+        if total > VISIBLE:
+            print(f"\n  \033[2m{mi+1}/{total}\033[0m")
+        cur_id = mods[mi].get("id", mods[mi].get("model", ""))
+        print(f"\n  \033[1mAuswahl:\033[0m \033[36m{cur_id}\033[0m")
+
+    while True:
+        _render(cur_prov, cur_mod)
+        key = _read_key()
+        mods = groups[providers[cur_prov]]
+        if key == "RIGHT":
+            cur_prov = (cur_prov + 1) % len(providers); cur_mod = 0
+        elif key == "LEFT":
+            cur_prov = (cur_prov - 1) % len(providers); cur_mod = 0
+        elif key == "DOWN":
+            cur_mod = min(cur_mod + 1, len(mods) - 1)
+        elif key == "UP":
+            cur_mod = max(cur_mod - 1, 0)
+        elif key in ("\r", "\n", " "):
+            sel = mods[cur_mod].get("id", mods[cur_mod].get("model", ""))
+            _cls()
+            return sel
+        elif key in ("q", "Q", "ESC", "\x03"):
+            _cls()
+            return current_model
+
+def _c(code: str, text: str) -> str:
+    """Compat-Wrapper — nutzt ui.py."""
+    m = {"bold": C.BOLD, "dim": C.DIM, "green": C.BGREEN,
+         "yellow": C.BYELLOW, "cyan": C.CYAN, "reset": C.RESET,
+         "red": C.BRED, "blue": C.BBLUE, "white": C.BWHITE}
+    return m.get(code, "") + text + C.RESET
+
+def _ask(prompt: str, default: str = "") -> str:
+    hint = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{hint}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return val or default
+
+def _pick(prompt: str, options: list[str], default: str = "") -> str:
+    print(f"\n{prompt}")
+    for i, o in enumerate(options, 1):
+        marker = " ◀" if o == default else ""
+        print(f"  {i}) {o}{marker}")
+    while True:
+        try:
+            val = input(f"  Wahl [1-{len(options)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        if not val and default:
+            return default
+        if val.isdigit() and 1 <= int(val) <= len(options):
+            return options[int(val)-1]
+        # Direkte Eingabe auch erlaubt
+        if val:
+            return val
+
+
+# ── Setup-Wizard ─────────────────────────────────────────────────────────────
+
+def run_setup(force: bool = False) -> bool:
+    """
+    Setup-Wizard. Gibt True zurück wenn Setup erfolgreich/vollständig.
+    """
+    state = get_state()
+    needs_setup = force or not state.get("selected_model")
+
+    print(_c("bold", "\n╔══════════════════════════════════════════╗"))
+    print(_c("bold",   "║        ai-coder  —  AILinux Agent        ║"))
+    print(_c("bold",   "╚══════════════════════════════════════════╝"))
+
+    # Session prüfen
+    previous_session = None
+    try:
+        previous_session = load_session()
+        if _is_token_expired(previous_session.token):
+            logged_in = False
+            print(f"\n{_c('yellow','! Session abgelaufen. Bitte erneut einloggen.')}")
+        else:
+            session = previous_session
+            print(f"\n✓ Eingeloggt als {_c('green', session.user_id)}  "
+                  f"(tier={session.tier}  base={session.base_url})")
+            logged_in = True
+    except RuntimeError:
+        logged_in = False
+        print(f"\n{_c('yellow','! Nicht eingeloggt.')}")
+
+    if not logged_in:
+        print("\n── Login ──────────────────────────────────")
+        base = _ask(
+            "Backend URL",
+            previous_session.base_url if previous_session else DEFAULT_BASE_URL,
+        )
+        email = _ask(
+            "E-Mail",
+            previous_session.user_id if previous_session else "",
+        )
+        password = getpass("Passwort: ")
+        if email and password:
+            from .client import ClientError, TriForceClient
+            client = TriForceClient(base)
+            try:
+                result = client.login(email=email, password=password)
+                session = Session(
+                    base_url=base, token=result["token"],
+                    client_id=result.get("client_id",""),
+                    user_id=result.get("user_id", email),
+                    tier=result.get("tier","unknown"),
+                    account_role=result.get("account_role","unknown"),
+                )
+                save_session(session)
+                print(f"✓ Login OK: {_c('green', session.user_id)}")
+                logged_in = True
+            except (ClientError, Exception) as e:
+                print(f"✗ Login fehlgeschlagen: {e}", file=sys.stderr)
+                return False
+        else:
+            print("Abgebrochen.")
+            return False
+
+    if not needs_setup:
+        return True
+
+    print("\n── Modell-Konfiguration ───────────────────")
+
+    # Verfügbare Modelle laden
+    popular = [
+        "groq/llama-3.3-70b-versatile",
+        "groq/moonshotai/kimi-k2-instruct",
+        "groq/qwen/qwen3-32b",
+        "gemini/gemini-2.0-flash",
+        "gemini/gemini-2.5-pro",
+        "anthropic/claude-sonnet-4",
+        "ollama/qwen3:8b",
+        "mistral/mistral-large-latest",
+        "(andere eingeben)",
+    ]
+    print(_c("dim", "  Tip: aicoder models --group  zeigt alle 625+ Modelle"))
+    print(_c("dim", "  Öffne interaktiven Modell-Picker..."))
+    _picked = model_picker_interactive(current_model=state.get("selected_model") or "")
+    if _picked:
+        model = _picked
+    else:
+        model = "groq/llama-3.3-70b-versatile"  # setup default
+
+    set_model(model)
+    print(f"  model → {_c('green', model)}")
+
+    print("\n── Agent-Team ─────────────────────────────")
+    print(_c("dim", "  Team-Modelle werden in Settings oder per /models konfiguriert."))
+    print(_c("dim", "  Standard: team_runtime=auto · Rollen verwenden @primary."))
+
+    print("\n── Workspace ──────────────────────────────")
+    ws_default = str(active_workspace(state.get("workspace_root")))
+    workspace = _ask("Projekt-Verzeichnis", ws_default)
+    if workspace:
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+        set_workspace(workspace)
+        print(f"  workspace → {_c('green', workspace)}")
+
+    print(f"\n{_c('green', '✓ Setup abgeschlossen.')}")
+    return True
+
+
+# ── Agent-REPL ────────────────────────────────────────────────────────────────
+
+def _setup_readline():
+    """Readline konfigurieren: History, Cursor, Tab-Completion."""
+    try:
+        import readline
+    except ImportError:
+        return  # Windows ohne pyreadline — input() funktioniert trotzdem
+
+    histfile = CONFIG_DIR / "history"
+    histfile.parent.mkdir(parents=True, exist_ok=True)
+
+    readline.set_history_length(500)
+    try:
+        readline.read_history_file(str(histfile))
+    except (FileNotFoundError, OSError):
+        pass
+
+    import atexit
+
+    def _write_history_safely() -> None:
+        try:
+            readline.write_history_file(str(histfile))
+        except OSError:
+            pass
+
+    atexit.register(_write_history_safely)
+
+    # Keybindings: Ctrl+J = literal newline wird zu " && " (Multiline-Hack)
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind("set show-all-if-ambiguous on")
+        readline.parse_and_bind("set colored-completion-prefix on")
+    except Exception:
+        pass
+
+    # Tab-Completion fuer Slash-Kommandos
+    _commands = COMMANDS
+
+    def _completer(text, state):
+        if text.startswith("/"):
+            matches = [c for c in _commands if c.startswith(text)]
+        else:
+            matches = []
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_completer)
+    readline.parse_and_bind("tab: complete")
+
+
+def _repl_settings_command(value: str) -> int:
+    """Handle /settings through the same canonical registry/store as CLI and GUI."""
+    parts = (value or "").split(None, 2)
+    action = parts[0].lower() if parts else "list"
+    if action in {"ask", "ai"}:
+        request = (value or "").split(None, 1)[1] if len((value or "").split(None, 1)) > 1 else ""
+        return _repl_settings_ai(request)
+    try:
+        if action in {"list", "ls"}:
+            state = settings_core.STORE.load()
+            for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+                spec = settings_core.REGISTRY[key]
+                if spec.sensitive:
+                    shown = "***"
+                else:
+                    shown = state.get(key, spec.default)
+                    if key == "enabled_tools":
+                        shown = "all" if shown is None else ("none" if shown == [] else ",".join(shown))
+                print(f"  {key:<22} = {shown}")
+            return 0
+        if action == "get" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else settings_core.STORE.get(key)
+            print(f"  {key} = {shown}")
+            return 0
+        if action == "set" and len(parts) >= 3:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            if not spec.mutable:
+                raise settings_core.SettingsError(f"'{key}' is read-only.")
+            value_to_set = settings_core.coerce(key, parts[2])
+            saved = settings_core.STORE.set(key, value_to_set)
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action == "reset" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            saved = settings_core.STORE.reset(key)
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action in {"explain", "describe"} and len(parts) >= 2:
+            data = settings_core.describe(parts[1])
+            print(f"  {data['key']} [{data['type']}] · group={data['group']}")
+            print(f"  {data['description']}")
+            print(f"  current={data['value']} · default={data['default']}")
+            if data["choices"]:
+                print(f"  choices={','.join(data['choices'])}")
+            if data["aliases"]:
+                print(f"  aliases={','.join(data['aliases'])}")
+            if data["security_impact"]:
+                print("  security-impacting setting")
+            return 0
+    except settings_core.SettingsError as exc:
+        print(f"  Fehler: {exc}")
+        return 2
+
+    print("  usage: /settings [list|get KEY|set KEY VALUE|reset KEY|explain KEY]")
+    return 2
+
+
+def _repl_mcp_command(value: str) -> int:
+    """Manage MCP servers through the canonical service without putting secrets in history."""
+    import shlex
+    from .mcp_registry import MCPServerConfig, apply_config_updates
+    from .mcp_service import (
+        authentication_status, authorize_and_save_server, authorize_oauth, doctor,
+        get_server, list_servers, remove_server, required_secret_field, save_server,
+        server_tools, set_server_enabled, test_server,
+    )
+
+    def ask(label: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        entered = input(f"  {label}{suffix}: ").strip()
+        return entered or default
+
+    def yes_no(label: str, default: bool = True) -> bool:
+        hint = "Y/n" if default else "y/N"
+        answer = input(f"  {label} [{hint}]: ").strip().lower()
+        if not answer:
+            return default
+        return answer in {"y", "yes", "j", "ja"}
+
+    def csv_list(label: str, current: list[str] | None = None) -> list[str]:
+        default = ",".join(current or [])
+        raw = ask(label, default)
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def parse_options(tokens: list[str]) -> dict[str, str | list[str]]:
+        options: dict[str, str | list[str]] = {}
+        i = 0
+        repeatable = {"arg", "env", "allow-tool", "deny-tool", "capability", "oauth-scope"}
+        while i < len(tokens):
+            token = tokens[i]
+            if not token.startswith("--"):
+                raise ValueError(f"unexpected argument: {token}")
+            key = token[2:]
+            if key == "secret":
+                raise ValueError("--secret is forbidden; credentials are entered through a hidden prompt")
+            if i + 1 >= len(tokens) or tokens[i + 1].startswith("--"):
+                raise ValueError(f"missing value for {token}")
+            val = tokens[i + 1]
+            if key in repeatable:
+                options.setdefault(key, [])
+                assert isinstance(options[key], list)
+                options[key].append(val)
+            else:
+                options[key] = val
+            i += 2
+        return options
+
+    def config_from_options(name: str, options: dict[str, str | list[str]], base: MCPServerConfig | None = None) -> MCPServerConfig:
+        c = MCPServerConfig.from_dict(base.__dict__) if base else MCPServerConfig(name=name)
+        c.name = name
+        scalar = lambda key, default="": str(options.get(key, default) or default)
+        if "transport" in options: c.transport = scalar("transport")
+        elif "url" in options: c.transport = "streamable-http"
+        elif "command" in options: c.transport = "stdio"
+        if "url" in options: c.url = scalar("url")
+        if "command" in options: c.command = scalar("command")
+        if "trust" in options: c.trust = scalar("trust")
+        if "auth" in options: c.auth_type = scalar("auth")
+        if "username" in options: c.auth_username = scalar("username")
+        if "header" in options: c.auth_header = scalar("header")
+        if "timeout" in options: c.timeout = int(scalar("timeout"))
+        if "oauth-authorization-url" in options: c.oauth_authorization_url = scalar("oauth-authorization-url")
+        if "oauth-token-url" in options: c.oauth_token_url = scalar("oauth-token-url")
+        if "oauth-client-id" in options: c.oauth_client_id = scalar("oauth-client-id")
+        mappings = {
+            "arg": "args", "env": "env_names", "allow-tool": "allow_tools",
+            "deny-tool": "deny_tools", "capability": "capability_tags", "oauth-scope": "oauth_scopes",
+        }
+        for source, target in mappings.items():
+            if source in options:
+                setattr(c, target, [str(x) for x in options[source]] if isinstance(options[source], list) else [str(options[source])])
+        return c
+
+    def wizard(existing: MCPServerConfig | None = None, supplied_name: str = "") -> tuple[MCPServerConfig, dict[str, str], bool]:
+        c = MCPServerConfig.from_dict(existing.__dict__) if existing else MCPServerConfig(name=supplied_name or "")
+        print("\n  ── MCP Server Setup ───────────────────────────")
+        c.name = ask("Name", c.name)
+        c.transport = ask("Transport (stdio/streamable-http)", c.transport or "streamable-http")
+        if c.transport == "stdio":
+            c.command = ask("Command", c.command)
+            c.args = shlex.split(ask("Arguments", shlex.join(c.args) if c.args else ""))
+            c.env_names = csv_list("Environment allowlist", c.env_names)
+            c.url = ""
+            c.auth_type = "none"
+        else:
+            c.url = ask("URL", c.url)
+            c.command = ""
+            c.args = []
+            c.env_names = []
+            c.auth_type = ask("Authentication (none/api-key/bearer/basic/oauth2/custom-header)", c.auth_type or "none")
+            if c.auth_type == "basic":
+                c.auth_username = ask("Username", c.auth_username)
+            else:
+                c.auth_username = ""
+            if c.auth_type in {"api-key", "custom-header"}:
+                default_header = c.auth_header or ("X-API-Key" if c.auth_type == "api-key" else "X-MCP-Token")
+                c.auth_header = ask("Header name", default_header)
+            if c.auth_type == "oauth2":
+                c.oauth_client_id = ask("OAuth Client ID", c.oauth_client_id)
+                c.oauth_authorization_url = ask("Authorization URL (blank = discovery)", c.oauth_authorization_url)
+                c.oauth_token_url = ask("Token URL (blank = discovery)", c.oauth_token_url)
+                c.oauth_scopes = csv_list("OAuth scopes", c.oauth_scopes)
+        c.trust = ask("Trust (untrusted/trusted)", c.trust or "untrusted")
+        c.timeout = int(ask("Timeout seconds", str(c.timeout or 30)))
+        c.allow_tools = csv_list("Allow tools (blank = all)", c.allow_tools)
+        c.deny_tools = csv_list("Deny tools", c.deny_tools)
+        c.capability_tags = csv_list("Capability tags", c.capability_tags)
+        c.enabled = yes_no("Enabled", c.enabled)
+
+        secrets: dict[str, str] = {}
+        field = required_secret_field(c)
+        status = authentication_status(c.name) if existing is not None else {"credential_status": {}}
+        present = bool((status.get("credential_status") or {}).get(field)) if field else False
+        if field and (not present or yes_no("Replace stored credential", False)):
+            secret = getpass(f"  {c.auth_type} credential: ").strip()
+            if not secret and not present:
+                raise ValueError("required credential was not provided")
+            if secret:
+                secrets[field] = secret
+        if c.auth_type == "oauth2" and yes_no("Store/replace OAuth client secret", False):
+            secret = getpass("  OAuth client secret: ").strip()
+            if secret:
+                secrets["oauth_client_secret"] = secret
+        run_test = yes_no("Test connection before saving", True)
+        return c, secrets, run_test
+
+    try:
+        parts = shlex.split(value or "")
+        action = parts[0].lower() if parts else "list"
+
+        if action in {"list", "ls"}:
+            for row in list_servers():
+                marker = "●" if row.get("enabled") else "○"
+                print(f"  {marker} {row['name']:<20} {row.get('transport',''):<16} {row.get('trust','')}")
+            return 0
+
+        if action == "keyring":
+            from .provider_credentials import credential_store_status
+            print(json.dumps(credential_store_status(), indent=2, ensure_ascii=False))
+            return 0
+
+        if action == "doctor" and len(parts) == 1:
+            print(json.dumps(doctor(), indent=2, ensure_ascii=False))
+            return 0
+
+        if action == "shared":
+            from .shared_notify import shared_mcp_directory
+            for row in shared_mcp_directory():
+                marker = "●" if row.get("online") else "○"
+                print(f"  {marker} {row.get('handle',''):<28} {row.get('label','')}")
+            return 0
+
+        if action == "add":
+            name = parts[1] if len(parts) > 1 and not parts[1].startswith("--") else ""
+            option_start = 2 if name else 1
+            options = parse_options(parts[option_start:]) if len(parts) > option_start else {}
+            if not name and not options:
+                config, secrets, run_test = wizard()
+            else:
+                if not name:
+                    name = ask("Name")
+                config = config_from_options(name, options)
+                if not options:
+                    config, secrets, run_test = wizard(supplied_name=name)
+                else:
+                    secrets = {}
+                    field = required_secret_field(config)
+                    if field:
+                        secret = getpass(f"  {config.auth_type} credential: ").strip()
+                        if not secret:
+                            raise ValueError("required credential was not provided")
+                        secrets[field] = secret
+                    if config.auth_type == "oauth2":
+                        secret = getpass("  OAuth client secret (optional): ").strip()
+                        if secret:
+                            secrets["oauth_client_secret"] = secret
+                    run_test = True
+            if config.auth_type == "oauth2":
+                check = authorize_and_save_server(config, secrets=secrets)
+            else:
+                check = save_server(config, secrets=secrets, test=run_test)
+            print(json.dumps(check, indent=2, ensure_ascii=False))
+            return 0
+
+        if len(parts) < 2:
+            raise ValueError("server name required")
+        name = parts[1]
+        if action == "share":
+            from .shared_notify import publish_mcp
+            handle = parts[2] if len(parts) > 2 else ""
+            print(json.dumps(publish_mcp(name, handle), indent=2, ensure_ascii=False))
+            return 0
+        if action == "unshare":
+            from .shared_notify import unpublish_mcp
+            if not unpublish_mcp(name):
+                raise ValueError(f"MCP server is not shared: {name}")
+            print(f"  {name} → share disabled")
+            return 0
+        if action == "set":
+            existing = get_server(name)
+            if existing is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            updates: dict[str, str] = {}
+            for item in parts[2:]:
+                if "=" not in item:
+                    raise ValueError("/mcp set requires KEY=VALUE pairs")
+                key, val = item.split("=", 1)
+                updates[key] = val
+            if not updates:
+                raise ValueError("/mcp set requires at least one KEY=VALUE pair")
+            config = apply_config_updates(existing, updates)
+            print(json.dumps(save_server(config, test=False), indent=2, ensure_ascii=False))
+            return 0
+        if action in {"enable", "disable"}:
+            set_server_enabled(name, action == "enable")
+            print(f"  {name} → {'enabled' if action == 'enable' else 'disabled'}")
+            return 0
+        if action == "remove":
+            if not remove_server(name):
+                raise ValueError(f"unknown MCP server: {name}")
+            print(f"  {name} → removed")
+            return 0
+        if action in {"doctor", "test"}:
+            print(json.dumps(test_server(name), indent=2, ensure_ascii=False))
+            return 0
+        if action == "tools":
+            for tool in server_tools(name):
+                read_only = bool((tool.get("annotations") or {}).get("readOnlyHint"))
+                print(f"  {tool.get('name',''):<36} {'read-only' if read_only else 'approval'}  {(tool.get('description','') or '')[:60]}")
+            return 0
+        if action == "edit":
+            existing = get_server(name)
+            if existing is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            config, secrets, run_test = wizard(existing)
+            if config.name != name:
+                raise ValueError("renaming MCP servers is not supported; create a new server instead")
+            if config.auth_type == "oauth2" and not authentication_status(name).get("configured"):
+                check = authorize_and_save_server(config, secrets=secrets)
+            else:
+                check = save_server(config, secrets=secrets, test=run_test)
+            print(json.dumps(check, indent=2, ensure_ascii=False))
+            return 0
+        if action == "auth":
+            config = get_server(name)
+            if config is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            if config.auth_type == "oauth2":
+                print(json.dumps(authorize_oauth(name), indent=2, ensure_ascii=False))
+                return 0
+            field = required_secret_field(config)
+            if field is None:
+                print("  Authentication: none")
+                return 0
+            secret = getpass(f"  {config.auth_type} credential: ").strip()
+            if not secret:
+                raise ValueError("credential was not changed")
+            print(json.dumps(save_server(config, secrets={field: secret}, test=True), indent=2, ensure_ascii=False))
+            return 0
+    except Exception as exc:
+        print(f"  Fehler: {type(exc).__name__}: {exc}")
+        return 2
+
+    print("  usage: /mcp [list|shared|share NAME [HANDLE]|unshare NAME|add|set NAME KEY=VALUE...|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME|keyring]")
+    return 2
+
+
+
+
+from .team_runtime import TEAM_ROLE_ALIASES as _MODEL_ROLE_KEYS, team_model_rows as _shared_team_model_rows
+
+
+def _team_model_rows(state: dict) -> list[tuple[str, str, str]]:
+    return [
+        (row["alias"], row["label"], row["configured"])
+        for row in _shared_team_model_rows(state)
+    ]
+
+
+def _repl_models_command(value: str) -> int:
+    parts = str(value or "").split(None, 2)
+    action = parts[0].lower() if parts else "show"
+    if action in {"show", "status", "roles"}:
+        state = get_state()
+        print("\n  ── Agent-Team Modelle ─────────────────────────")
+        for alias, label, model in _team_model_rows(state):
+            print(f"  {alias:<12} {label:<38} {model}")
+        print("\n  /models pick <rolle>        interaktiver Picker")
+        print("  /models set <rolle> <id>    Modell direkt setzen; off deaktiviert Slot")
+        print("  /models list                verfügbare Backend-Modelle anzeigen")
+        return 0
+    if action == "list":
+        try:
+            session = load_session()
+            from .client import TriForceClient, model_identifier
+            client = TriForceClient(session.base_url, token=session.token, timeout=15)
+            data = client.model_catalog()
+            models = sorted(
+                model_id for item in data.get("models", [])
+                if (model_id := model_identifier(item))
+            )
+            groups: dict[str, list[str]] = {}
+            for model in models:
+                provider = model.split("/", 1)[0] if "/" in model else "other"
+                groups.setdefault(provider, []).append(model)
+            print(f"  {data.get('tier','?')} · {len(models)} Modelle")
+            for provider, rows in sorted(groups.items()):
+                print(f"\n  [{provider}] ({len(rows)})")
+                for model in rows:
+                    print(f"    {model}")
+            return 0
+        except Exception as exc:
+            print(f"  Fehler: {exc}")
+            return 1
+    if action in {"set", "pick"} and len(parts) >= 2:
+        alias = parts[1].lower()
+        key = _MODEL_ROLE_KEYS.get(alias)
+        if not key:
+            print(f"  Unbekannte Rolle: {alias}")
+            return 2
+        if action == "pick":
+            current = str(get_state().get(key) or "")
+            selected = model_picker_interactive(current_model=current if current != "@primary" else str(get_state().get("selected_model") or ""))
+            if not selected:
+                print("  nicht geändert")
+                return 0
+            value_to_set = selected
+        else:
+            if len(parts) < 3:
+                print("  usage: /models set <rolle> <model|@primary|off>")
+                return 2
+            value_to_set = parts[2].strip()
+        if value_to_set.lower() in {"off", "none", "disabled"}:
+            value_to_set = ""
+        try:
+            saved = settings_core.STORE.set(key, value_to_set)
+        except settings_core.SettingsError as exc:
+            print(f"  Fehler: {exc}")
+            return 2
+        print(f"  {alias} → {saved.get(key) or 'off'}")
+        return 0
+    print("  usage: /models [show|list|pick ROLE|set ROLE MODEL]")
+    return 2
+
+
+def _repl_runtime_command(value: str) -> int:
+    parts = str(value or "").split()
+    state = get_state()
+    if not parts:
+        print("\n  ── Runtime ────────────────────────────────────")
+        print(f"  agent      {state.get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+        print(f"  workspace  {state.get('workspace_mode', 'auto')}")
+        print(f"  team       {state.get('team_runtime_mode', 'auto')}")
+        print("\n  /runtime agent native-light|classic")
+        print("  /runtime workspace auto|ram|disk")
+        print("  /runtime team auto|on|off")
+        return 0
+    if len(parts) == 1 and parts[0] in settings_core.RUNTIME_MODES:
+        return _repl_runtime_command("agent " + parts[0])
+    if len(parts) != 2:
+        print("  usage: /runtime [agent MODE|workspace MODE|team MODE]")
+        return 2
+    target, value_to_set = parts[0].lower(), parts[1].lower()
+    key = {"agent": "runtime_mode", "workspace": "workspace_mode", "team": "team_runtime_mode"}.get(target)
+    if not key:
+        print(f"  Unbekannter Runtime-Bereich: {target}")
+        return 2
+    try:
+        saved = settings_core.STORE.set(key, value_to_set)
+    except settings_core.SettingsError as exc:
+        print(f"  Fehler: {exc}")
+        return 2
+    print(f"  {target} → {saved.get(key)}")
+    return 0
+
+
+def _extract_json_object(text: str) -> dict:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lstrip().startswith("json"):
+            raw = raw.lstrip()[4:].lstrip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("model returned no JSON object")
+        value = json.loads(raw[start:end+1])
+    if not isinstance(value, dict):
+        raise ValueError("model returned non-object JSON")
+    return value
+
+
+def _repl_settings_ai(request: str) -> int:
+    if not request.strip():
+        print("  usage: /settings ask <was du ändern möchtest>")
+        return 2
+    try:
+        from .client import TriForceClient
+        from .settings_tools import plan_patch
+        session = load_session()
+        state = get_state()
+        model = str(state.get("selected_model") or "").strip()
+        client = TriForceClient(session.base_url, token=session.token, timeout=int(state.get("request_timeout", 300)))
+        from .model_transport import native_model_transport_from_env
+        client, configured_model = native_model_transport_from_env(client, default_model=model or None)
+        model = str(configured_model or model or "").strip()
+        schema_rows = []
+        for key, spec in sorted(settings_core.REGISTRY.items()):
+            if spec.sensitive or not spec.mutable:
+                continue
+            schema_rows.append({
+                "key": key, "type": spec.type, "default": spec.default,
+                "choices": spec.choice_list(), "description": spec.description,
+                "security_impact": spec.security_impact,
+            })
+        result = client.chat(
+            message=(
+                "User request for AICoder settings:\n" + request +
+                "\n\nCurrent settings:\n" + json.dumps({k: state.get(k) for k in settings_core.REGISTRY}, ensure_ascii=False) +
+                "\n\nAllowed schema:\n" + json.dumps(schema_rows, ensure_ascii=False) +
+                "\n\nReturn ONLY JSON: {\"patch\":{...},\"reason\":\"short explanation\"}. "
+                "Use only schema keys. Do not change security-impacting settings unless the request explicitly asks for it."
+            ),
+            model=model or None,
+            system_prompt="You are a settings assistant. Propose configuration only; never execute tools or invent settings.",
+            temperature=0.1, max_tokens=2000, fallback_model=None,
+        )
+        proposal = _extract_json_object(str(result.get("response") or ""))
+        patch = proposal.get("patch")
+        plan = plan_patch(patch)
+        changes = plan.get("changes", [])
+        if not changes:
+            print("  KI-Vorschlag enthält keine wirksame Änderung.")
+            return 0
+        print("\n  ── KI-Vorschlag ───────────────────────────────")
+        if proposal.get("reason"):
+            print(f"  {proposal['reason']}")
+        for change in changes:
+            flag = " ⚠ security" if change.get("security_impact") else ""
+            print(f"  {change['key']}: {change['old']} → {change['new']}{flag}")
+        answer = input("  Änderungen übernehmen? [y/N] ").strip().lower()
+        if answer not in {"y", "yes", "j", "ja"}:
+            print("  nicht übernommen")
+            return 0
+        normalized = {
+            settings_core.resolve_key(str(key)): settings_core.coerce(str(key), value)
+            for key, value in dict(patch or {}).items()
+        }
+        settings_core.STORE.update(**normalized)
+        print("  ✓ Einstellungen übernommen und validiert")
+        return 0
+    except Exception as exc:
+        print(f"  KI-Settings-Hilfe fehlgeschlagen: {type(exc).__name__}: {exc}")
+        return 1
+
+def run_repl(skip_setup: bool = False) -> int:
+    """
+    Interaktiver Agent-REPL.
+    Startet Setup-Wizard wenn nötig, dann Agent-Loop.
+    """
+    _setup_readline()
+
+    session_valid = _ensure_valid_session()
+    if not skip_setup or not session_valid:
+        ok = run_setup()
+        if not ok:
+            return 1
+
+    state = get_state()
+    model    = state.get("selected_model")
+    ws       = str(active_workspace(state.get("workspace_root")))
+
+    def _toolbar() -> str:
+        current = get_state()
+        active_model = current.get("selected_model") or "backend"
+        mode = current.get("tool_mode", "on_demand")
+        approval = current.get("approval_mode", "ask")
+        runtime = current.get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        return f"  {active_model} · runtime:{runtime} · workspace:{current.get('workspace_mode','auto')} · team:{current.get('team_runtime_mode','auto')} · tools:{mode} · approvals:{approval}"
+
+    repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
+    conversation: list[dict] = []
+
+    def _print_repl_header() -> None:
+        nonlocal state, model, ws
+        state = get_state()
+        model = state.get("selected_model")
+        ws = str(active_workspace(state.get("workspace_root")))
+        tool_mode = state.get("tool_mode", "on_demand")
+        enabled = state.get("enabled_tools")
+        timeout = int(state.get("request_timeout", 300))
+        try:
+            session = load_session()
+            identity = f"{session.user_id} · {session.tier}"
+        except Exception:
+            identity = "offline"
+
+        w = max(48, min(term_width(), 92))
+        rule = "─" * (w - 4)
+        print()
+        print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  {C.DIM}interactive agent{C.RESET}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+        print(f"  {dim('account  ')} {cyan(identity)}")
+        print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
+        approval_mode = state.get("approval_mode", "ask")
+        runtime_mode = state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        print(f"  {dim('runtime  ')} mode={cyan(runtime_mode)} · tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
+              f"approvals={cyan(approval_mode)} · workspace={cyan(str(state.get('workspace_mode','auto')))} · team={cyan(str(state.get('team_runtime_mode','auto')))} · timeout={cyan(str(timeout)+'s')}")
+        print(f"  {dim('workspace')} {dim(ws)}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+        if repl_input.enhanced:
+            print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
+        else:
+            print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
+        print(f"  {dim('/help · /command <name> [args] · /runtime native-light · /plan · /new · /exit')}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+
+    _print_repl_header()
+
+    from .agent import run_agent
+
+    while True:
+        try:
+            reset_live_line()
+            prompt = repl_input.read(f"\n  {C.BOLD}{C.BCYAN}◆{C.RESET} ").strip()
+        except PromptCancelled:
+            print(f"  {dim('prompt cancelled')}")
+            continue
+        except KeyboardInterrupt:
+            print(f"  {dim('prompt cancelled')}")
+            continue
+        except EOFError:
+            print(f"\n{_c('dim','Session beendet.')}")
+            break
+
+        if not prompt:
+            continue
+
+        # Slash-Kommandos
+        if prompt.startswith("/"):
+            parts = prompt.split(None, 1)
+            cmd   = parts[0].lower()
+            val   = parts[1] if len(parts) > 1 else ""
+
+            if cmd in ("/exit","/quit","/q"):
+                print(_c("dim","Session beendet."))
+                break
+            elif cmd == "/setup":
+                run_setup(force=True)
+                _print_repl_header()
+            elif cmd == "/model":
+                if val:
+                    set_model(val)
+                    refreshed = get_state()
+                    model = refreshed.get("selected_model")
+                    print(f"  model → {val}")
+                else:
+                    new = model_picker_interactive(current_model=model or "")
+                    if new and new != model:
+                        set_model(new)
+                        model = new
+                        print(f"  model → {cyan(model)}")
+            elif cmd == "/status":
+                _print_repl_header()
+            elif cmd == "/tools":
+                if val:
+                    try:
+                        set_tool_mode(val.strip())
+                        print(f"  tools → {val.strip()}")
+                        _print_repl_header()
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    print(f"  tools = {get_state().get('tool_mode', 'on_demand')}")
+                    print("  set: /tools off|on_demand|always")
+            elif cmd == "/settings":
+                _repl_settings_command(val)
+                state = get_state()
+                model = state.get("selected_model")
+            elif cmd == "/mcp":
+                _repl_mcp_command(val)
+            elif cmd == "/runtime":
+                _repl_runtime_command(val)
+                _print_repl_header()
+            elif cmd == "/guidelines":
+                from .guidelines import load_guidelines
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                rows = load_guidelines(workspace)
+                if not rows:
+                    print("  no guidelines discovered")
+                for scope, text in rows:
+                    print(f"\n  [{scope}]\n{text}")
+            elif cmd == "/commands":
+                from .commands import discover_commands
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                commands = discover_commands(workspace)
+                if not commands:
+                    print("  no commands discovered")
+                for item in commands:
+                    print(f"  {item.name:<20} {item.scope:<18} {item.description}")
+            elif cmd == "/command":
+                from .commands import expand_command
+                command_parts = val.split(None, 1)
+                if not command_parts:
+                    print("  usage: /command <name> [arguments]")
+                else:
+                    command_name = command_parts[0]
+                    command_args = command_parts[1] if len(command_parts) > 1 else ""
+                    expanded, is_error = expand_command(
+                        str(active_workspace(get_state().get("workspace_root"))),
+                        command_name,
+                        command_args,
+                    )
+                    if is_error:
+                        print(f"  {expanded}")
+                    else:
+                        try:
+                            run_agent(
+                                initial_prompt=expanded,
+                                model=model,
+                                fallback_model=None,
+                                conversation=conversation,
+                                runtime_mode="native-light",
+                            )
+                        except KeyboardInterrupt:
+                            print(f"\n{_c('yellow','[unterbrochen]')}")
+                        except Exception as e:
+                            print(f"\n[Fehler] {e}", file=sys.stderr)
+            elif cmd == "/plan":
+                from .agent_plan import PlanStore, format_plan
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                store = PlanStore()
+                if val.strip().lower() == "clear":
+                    print("  current plan cleared" if store.clear_current(workspace) else "  no current plan")
+                elif val.strip().lower() == "list":
+                    plans = store.list(workspace, limit=10)
+                    if not plans:
+                        print("  no plans")
+                    for plan in plans:
+                        print(f"  {plan.id}  {plan.status:<9} iter={plan.iteration:<3} {plan.task[:60]}")
+                else:
+                    plan = store.load_current(workspace)
+                    if plan is None:
+                        print("  no current plan")
+                    else:
+                        print("\n" + format_plan(plan))
+            elif cmd == "/clear":
+                if sys.stdout.isatty():
+                    print("\033[2J\033[H", end="")
+                _print_repl_header()
+            elif cmd == "/new":
+                conversation.clear()
+                print(f"  {cyan('new session')} {dim('· conversation context cleared')}")
+            elif cmd == "/keys":
+                print("  Enter        Aufgabe senden")
+                print("  Alt+Enter    Neue Zeile (Shift+Enter in kompatiblen Terminals)")
+                print("  Ctrl+C       Eingabe leeren; leer erneut = aktuellen Prompt abbrechen")
+                print("  Ctrl+D       Zeichen löschen; bei leerer Eingabe Session beenden")
+                print("  Ctrl+R       History durchsuchen")
+                print("  Ctrl+P/N     Vorige/nächste History")
+                print("  Ctrl+L       Terminal neu zeichnen")
+                print("  Tab          Slash-Kommandos vervollständigen")
+            elif cmd == "/permissions":
+                if val:
+                    aliases = {"manual": "ask", "auto": "autopilot"}
+                    requested = aliases.get(val.strip().lower(), val.strip().lower())
+                    try:
+                        set_approval_mode(requested)
+                        print(f"  approvals → {requested}")
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    active = get_state().get("approval_mode", "ask")
+                    print(f"  Lokale Berechtigungsrichtlinie · aktiv: {active}")
+                    print("  ask        jede Änderung einzeln bestätigen")
+                    print("  autopilot  normale Schreibzugriffe automatisch; sudo/delete weiter bestätigen")
+                    print("  all        Workspace-Schreibzugriffe automatisch; Löschen weiter bestätigen")
+                    print("  root/sudo  im Coding-only-Profil grundsätzlich deaktiviert")
+                    print("  Setzen: /permissions ask|autopilot|all")
+            elif cmd == "/shell":
+                print("  /shell ist im Coding-only-Profil deaktiviert.")
+            elif cmd == "/team":
+                team_parts = val.split(None, 1)
+                team_action = team_parts[0].lower() if team_parts else "show"
+                team_rest = team_parts[1] if len(team_parts) > 1 else ""
+                if team_action == "mode":
+                    _repl_runtime_command("team " + team_rest)
+                elif team_action in {"models", "list"}:
+                    _repl_models_command("list")
+                elif team_action in {"show", "status", "roles", "set", "pick"}:
+                    _repl_models_command((team_action + (" " + team_rest if team_rest else "")).strip())
+                else:
+                    print("  usage: /team [show|models|mode auto|on|off|set ROLE MODEL|pick ROLE]")
+            elif cmd == "/models":
+                _repl_models_command(val)
+            elif cmd == "/help":
+                print("  /team · /models · /settings · /mcp · /runtime · /status")
+                print("  /team [show|models|mode|set|pick] · /runtime [agent|workspace|team] · /settings [ask|set|get]")
+                print("  /commands · /command <name> [args] · /guidelines")
+                print("  /setup · /new · /clear · /keys · /permissions · /exit")
+            else:
+                print(f"  Unbekannt: {cmd}  — /help für Hilfe")
+            continue
+
+        # Agent-Task ausführen
+        try:
+            run_agent(
+                initial_prompt=prompt,
+                model=model,
+                fallback_model=None,
+                conversation=conversation,
+            )
+        except KeyboardInterrupt:
+            print(f"\n{_c('yellow','[unterbrochen]')}")
+        except Exception as e:
+            print(f"\n[Fehler] {e}", file=sys.stderr)
+
+    return 0

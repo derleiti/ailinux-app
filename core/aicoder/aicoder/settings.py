@@ -1,0 +1,641 @@
+"""Canonical settings registry and store for AICoder.
+
+This module is the single source of truth for *what* a setting is: its type,
+default, allowed values, description and security classification.  CLI, GUI,
+REPL and the LLM-facing settings tools all read this registry instead of
+carrying their own copies of defaults and choice lists.
+
+Design notes
+------------
+* The state path is resolved *per call*, never captured at import time.  The
+  existing test-suite patches ``session_state.STATE_FILE`` at runtime, and the
+  GUI may be started with a different config dir than the CLI.
+* Writes go through ``config.atomic_write_private`` (mkstemp -> fsync ->
+  chmod 0600 -> os.replace), guarded by an advisory *file* lock so that a
+  concurrent CLI and GUI process cannot lose each other's update.  A
+  ``threading.Lock`` alone only protects threads inside one process.
+* A corrupted ``state.json`` is preserved as ``state.json.corrupt-<stamp>``
+  instead of being silently overwritten with defaults, so the cause stays
+  diagnosable.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+from .config import CONFIG_DIR, atomic_write_private
+
+try:  # POSIX advisory locking
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows advisory locking
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
+
+
+SCHEMA_VERSION = 1
+_SCHEMA_KEY = "_schema_version"
+
+SWARM_MODES = {"off", "auto", "on", "review"}
+TOOL_MODES = {"off", "on_demand", "always"}
+APPROVAL_MODES = {"ask", "autopilot", "all"}
+RUNTIME_MODES = {"classic", "native-light"}
+WORKSPACE_MODES = {"auto", "ram", "disk"}
+TEAM_RUNTIME_MODES = {"off", "auto", "on"}
+DEFAULT_RUNTIME_MODE = "native-light"
+
+
+class SettingsError(ValueError):
+    """Raised when a value does not satisfy its schema entry."""
+
+
+# --------------------------------------------------------------------------
+# Schema
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SettingSpec:
+    """Metadata for exactly one setting.
+
+    ``security_impact`` marks settings whose change can widen what the agent is
+    allowed to do without asking.  The policy layer requires explicit user
+    confirmation for those, even when the current approval mode is permissive —
+    an LLM must never be able to grant itself more privilege by writing a
+    setting.
+    """
+
+    key: str
+    type: str                      # str | int | bool | enum | path | list | model
+    default: Any
+    description: str
+    group: str
+    choices: Optional[frozenset] = None
+    minimum: Optional[int] = None
+    maximum: Optional[int] = None
+    aliases: Tuple[str, ...] = ()
+    sensitive: bool = False        # never printed / never exposed to the model
+    mutable: bool = True           # False = read-only, diagnostic value
+    restart_required: bool = False
+    security_impact: bool = False
+    nullable: bool = False
+
+    def choice_list(self) -> List[str]:
+        return sorted(self.choices) if self.choices else []
+
+
+REGISTRY: Dict[str, SettingSpec] = {}
+
+
+def _register(spec: SettingSpec) -> SettingSpec:
+    REGISTRY[spec.key] = spec
+    return spec
+
+
+_register(SettingSpec(
+    key="selected_model", type="model", default=None, nullable=True,
+    group="model", aliases=("model",),
+    description="Primary coding model, as 'provider/model'. Unset means the backend default.",
+))
+_register(SettingSpec(
+    key="linked_account_providers", type="list", default=[],
+    group="model", aliases=("linked_accounts", "account_providers"),
+    description=(
+        "Non-secret list of provider account integrations enabled in AICoder. "
+        "Provider credentials remain owned by the official provider client and are never copied into AICoder state."
+    ),
+))
+_register(SettingSpec(
+    key="swarm_mode", type="enum", default="off", choices=frozenset(SWARM_MODES),
+    group="agent", aliases=("swarm",),
+    description="Multi-model swarm behaviour: off, auto (on demand), on (always), review (second opinion only).",
+))
+_register(SettingSpec(
+    key="projects_root", type="path", default=str(Path.home() / "workspace"),
+    group="workspace", aliases=("projects", "project_root"),
+    description="Container directory for projects. Team runs must target a concrete project below this root.",
+))
+_register(SettingSpec(
+    key="workspace_root", type="path", default=None, nullable=True,
+    group="workspace", aliases=("workspace",),
+    description="Active concrete project directory. All file tools and team workspaces are scoped to this root.",
+))
+_register(SettingSpec(
+    key="workspace_mode", type="enum", default="auto", choices=frozenset(WORKSPACE_MODES),
+    group="workspace", aliases=("execution_workspace", "workspace_execution"),
+    description=(
+        "Execution workspace: auto prefers an isolated transactional RAM workspace when safe, "
+        "ram requests RAM with automatic disk fallback, disk uses the source tree directly."
+    ),
+))
+_register(SettingSpec(
+    key="tool_mode", type="enum", default="on_demand", choices=frozenset(TOOL_MODES),
+    group="tools", aliases=("tool-mode",),
+    description=(
+        "Tool discovery: off (never), on_demand (load tools only for tool-relevant turns), "
+        "always (expose the catalogue every turn)."
+    ),
+))
+_register(SettingSpec(
+    key="enabled_tools", type="list", default=None, nullable=True,
+    group="tools", aliases=("tools",),
+    description=(
+        "Allow-list of tool names. Unset means every discovered tool. "
+        "Nothing — not a plugin, not the model — can re-enable a tool excluded here."
+    ),
+))
+_register(SettingSpec(
+    key="native_openrouter_tool_calling", type="bool", default=False,
+    group="tools", aliases=("openrouter_native_tools", "native_openrouter_tools"),
+    description=(
+        "Experimental compatibility switch. AICoder uses its provider-independent "
+        "text tool protocol by default for every model. Enable this only to send "
+        "provider-native tools/tool_choice to OpenRouter models."
+    ),
+))
+_register(SettingSpec(
+    key="request_timeout", type="int", default=300, minimum=10, maximum=300,
+    group="runtime", aliases=("timeout",),
+    description=("Seconds of provider/network inactivity allowed while waiting for an LLM request. "
+        "Streaming keepalive activity resets this idle timer; it is not a hard total turn deadline "
+        "and is unrelated to shell/subprocess timeouts."),
+))
+_register(SettingSpec(
+    key="system_log_monitor_enabled", type="bool", default=False, group="monitoring",
+    description="Analyze suspicious local system log events automatically with the current base model; analysis is read-only.",
+))
+_register(SettingSpec(
+    key="system_log_interval_seconds", type="int", default=60, minimum=10, maximum=3600, group="monitoring",
+    description="Polling interval for automatic system log analysis.",
+))
+_register(SettingSpec(
+    key="system_log_since_seconds", type="int", default=300, minimum=10, maximum=86400, group="monitoring",
+    description="Initial/manual system log lookback window in seconds.",
+))
+_register(SettingSpec(
+    key="system_log_cooldown_seconds", type="int", default=900, minimum=0, maximum=86400, group="monitoring",
+    description="Minimum delay before repeating an identical automatic notification.",
+))
+_register(SettingSpec(
+    key="system_log_min_severity", type="enum", default="warning", choices=frozenset({"info", "warning", "security", "critical"}), group="monitoring",
+    description="Minimum AI-classified severity that may trigger an automatic notification.",
+))
+_register(SettingSpec(
+    key="system_log_notify_security", type="bool", default=True, group="monitoring",
+    description="Allow automatic notifications for security-classified log events.",
+))
+_register(SettingSpec(
+    key="system_log_notify_errors", type="bool", default=True, group="monitoring",
+    description="Allow automatic notifications for warning/critical operational errors.",
+))
+_register(SettingSpec(
+    key="max_output_tokens", type="int", default=16384, minimum=256, maximum=200000,
+    group="runtime", aliases=("max_tokens", "output_tokens"),
+    description=(
+        "Upper bound on tokens the model may write per request. This is the reply "
+        "budget, not the context window. The old hard-coded 4096 truncated any "
+        "generated file past roughly 370 lines mid-line."
+    ),
+))
+_register(SettingSpec(
+    key="approval_mode", type="enum", default="ask", choices=frozenset(APPROVAL_MODES),
+    group="security", aliases=("approval",), security_impact=True,
+    description=(
+        "When mutations need confirmation: ask (every mutation), autopilot (safe writes "
+        "without asking), all (all mutations without asking). Lowering this widens what runs unattended."
+    ),
+))
+_register(SettingSpec(
+    key="runtime_mode", type="enum", default=DEFAULT_RUNTIME_MODE, choices=frozenset(RUNTIME_MODES),
+    group="runtime", aliases=("runtime",), restart_required=True,
+    description="Agent engine: native-light (default agentic loop) or classic (compatibility mode).",
+))
+
+_register(SettingSpec(
+    key="team_runtime_mode", type="enum", default="auto", choices=frozenset(TEAM_RUNTIME_MODES),
+    group="team", aliases=("team_runtime",),
+    description="Experimental team runtime: off, auto for complex coding tasks, or on for every action task.",
+))
+_register(SettingSpec(
+    key="team_brainstorm_rounds", type="int", default=2, minimum=1, maximum=5,
+    group="team", aliases=("brainstorm_rounds",),
+    description="Brainstorm rounds between research and implementation planning (1-5).",
+))
+_register(SettingSpec(
+    key="team_research_model_1", type="model", default="@primary", group="team",
+    description="Research 1: Primary Sources. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_2", type="model", default="@primary", group="team",
+    description="Research 2: Best Practices. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_3", type="model", default="@primary", group="team",
+    description="Research 3: Security/Reliability. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_4", type="model", default="@primary", group="team",
+    description="Research 4: Alternative Architectures. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_1", type="model", default="@primary", group="team",
+    description="Coder 1: Conservative/minimal. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_2", type="model", default="@primary", group="team",
+    description="Coder 2: Architecture-first. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_3", type="model", default="@primary", group="team",
+    description="Coder 3: Performance/efficiency. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_4", type="model", default="@primary", group="team",
+    description="Coder 4: Robustness/security. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_planner_model", type="model", default="@primary", group="team",
+    description="Planner model. @primary reuses the base model; empty/off disables optional roles.",
+))
+_register(SettingSpec(
+    key="team_coordinator_model", type="model", default="@primary", group="team",
+    description="Coordinator model. @primary reuses the base model; empty/off disables optional roles.",
+))
+_register(SettingSpec(
+    key="team_merge_model", type="model", default="@primary", group="team",
+    description="Preferred merge/integration model. @primary reuses the base model; empty/off disables only the dedicated merge slot, while ensemble integration falls back to coordinator/planner/base model.",
+))
+_register(SettingSpec(
+    key="team_test_planner_model", type="model", default="@primary", group="team",
+    description="Test-planner model. @primary reuses the base model; empty/off disables optional roles.",
+))
+
+
+DEFAULTS: Dict[str, Any] = {key: spec.default for key, spec in REGISTRY.items()}
+
+_ALIAS_MAP: Dict[str, str] = {}
+for _key, _spec in REGISTRY.items():
+    _ALIAS_MAP[_key] = _key
+    for _alias in _spec.aliases:
+        _ALIAS_MAP[_alias] = _key
+
+
+def resolve_key(name: str) -> str:
+    """Map a user-facing name or alias to its canonical setting key."""
+    canonical = _ALIAS_MAP.get(str(name).strip().replace("-", "_").lower()) \
+        or _ALIAS_MAP.get(str(name).strip().lower())
+    if canonical is None:
+        raise SettingsError(
+            f"Unknown setting '{name}'. Known: {', '.join(sorted(REGISTRY))}"
+        )
+    return canonical
+
+
+def spec_for(name: str) -> SettingSpec:
+    return REGISTRY[resolve_key(name)]
+
+
+# --------------------------------------------------------------------------
+# Legacy migration
+# --------------------------------------------------------------------------
+
+_CONSOLIDATED_TOOL_RENAMES = {
+    # Verified one-to-one names from the current TriForce consolidated registry.
+    # Ambiguous removals intentionally remain untouched to avoid broadening a
+    # custom operator selection without consent.
+    "health": "status",
+    "logs": "log_viewer",
+    "logs_errors": "log_viewer",
+    "web_search": "search",
+    "web_search_local": "search",
+    "doc_search": "search",
+}
+
+# Before the operator tool policy was centralized, the Settings UI persisted
+# "Select all" as a concrete snapshot. That snapshot now contains removed
+# admin/ops tools and omits newly introduced safe tools, so filtering it against
+# the current catalogue produces the misleading 27/40 state. Migrate only this
+# exact historical all-tools snapshot; real custom selections remain untouched.
+_LEGACY_ALL_TOOLS = frozenset({
+    "agents", "clipboard_read", "clipboard_write", "code_grep", "code_read",
+    "code_search", "code_tree", "dev_analyze", "dev_debug", "dev_links",
+    "dev_lint", "dev_refactor", "dev_summarize", "devops", "doc_read",
+    "doc_search", "file_edit", "file_read", "file_tree", "git", "health",
+    "lint", "local_exec", "logs", "logs_errors", "logs_stats",
+    "memory_search", "memory_store", "models", "ollama_list", "ollama_status",
+    "remote_hosts", "remote_status", "search", "status", "test", "vault_keys",
+    "vault_status", "web_fetch_local", "web_search_local",
+})
+
+
+def migrate_enabled_tools(value: Any) -> Optional[List[str]]:
+    """Convert the obsolete explicit 'all tools' snapshot back to its meaning."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return []
+    normalized = [str(name) for name in value if isinstance(name, str) and name]
+    if frozenset(normalized) == _LEGACY_ALL_TOOLS:
+        return None
+    migrated: List[str] = []
+    seen: set[str] = set()
+    for name in normalized:
+        canonical = _CONSOLIDATED_TOOL_RENAMES.get(name, name)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        migrated.append(canonical)
+    return migrated
+
+
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def coerce(name: str, value: Any) -> Any:
+    """Validate and normalize a single value against its schema entry."""
+    spec = spec_for(name)
+
+    if value is None:
+        if spec.nullable or spec.default is None:
+            return None
+        raise SettingsError(f"'{spec.key}' cannot be null.")
+
+    if spec.type == "enum":
+        text = str(value).strip()
+        if text not in (spec.choices or frozenset()):
+            raise SettingsError(
+                f"Invalid value '{text}' for '{spec.key}'. Allowed: {', '.join(spec.choice_list())}"
+            )
+        return text
+
+    if spec.type == "int":
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise SettingsError(f"'{spec.key}' expects a whole number, got '{value}'.") from None
+        if spec.minimum is not None and number < spec.minimum:
+            raise SettingsError(f"'{spec.key}' must be >= {spec.minimum} (got {number}).")
+        if spec.maximum is not None and number > spec.maximum:
+            raise SettingsError(f"'{spec.key}' must be <= {spec.maximum} (got {number}).")
+        return number
+
+    if spec.type == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _TRUE:
+            return True
+        if text in _FALSE:
+            return False
+        raise SettingsError(f"'{spec.key}' expects a boolean, got '{value}'.")
+
+    if spec.type == "list":
+        if isinstance(value, str):
+            text = value.strip()
+            if text.lower() in {"all", "*"}:
+                return None
+            if text.lower() in {"none", "-"}:
+                return []
+            items = [part.strip() for part in text.split(",")]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            items = [str(part).strip() for part in value]
+        else:
+            raise SettingsError(f"'{spec.key}' expects a list or comma-separated string.")
+        return sorted({item for item in items if item})
+
+    if spec.type == "path":
+        text = str(value).strip()
+        if not text:
+            return None
+        return str(Path(text).expanduser())
+
+    return str(value)
+
+
+def apply_invariants(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Enforce cross-setting rules centrally, so no UI can bypass them."""
+    return data
+
+
+# --------------------------------------------------------------------------
+# Store
+# --------------------------------------------------------------------------
+
+def default_state_path() -> Path:
+    """Resolved per call — the config dir may be patched or differ per process."""
+    return CONFIG_DIR / "state.json"
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Advisory cross-process lock on a sidecar file.
+
+    A ``threading.Lock`` only serialises threads inside one interpreter; a GUI
+    and a CLI process editing the same state.json need a lock the kernel knows
+    about.  Failure to lock is never fatal: on platforms without flock support
+    we degrade to the previous behaviour rather than refusing to save.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    except OSError:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:  # pragma: no cover - Windows
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+@dataclass
+class _CacheEntry:
+    stamp: Tuple[str, int, int]
+    data: Dict[str, Any]
+
+
+class SettingsStore:
+    """Reads and writes state.json against the canonical registry."""
+
+    def __init__(self, path_resolver: Callable[[], Path] = default_state_path) -> None:
+        self._resolve = path_resolver
+        self._cache: Optional[_CacheEntry] = None
+        self._lock = threading.Lock()
+
+    # -- path / cache -----------------------------------------------------
+    @property
+    def path(self) -> Path:
+        return Path(self._resolve())
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cache = None
+
+    def _stamp(self, path: Path) -> Tuple[str, int, int]:
+        try:
+            stat = path.stat()
+            return (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return (str(path), -1, -1)
+
+    # -- corruption -------------------------------------------------------
+    def _quarantine(self, path: Path) -> Optional[Path]:
+        """Preserve an unreadable state file instead of destroying evidence."""
+        target = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+        try:
+            os.replace(path, target)
+            return target
+        except OSError:
+            return None
+
+    # -- read -------------------------------------------------------------
+    def load(self) -> Dict[str, Any]:
+        path = self.path
+        stamp = self._stamp(path)
+        with self._lock:
+            if self._cache is not None and self._cache.stamp == stamp:
+                return dict(self._cache.data)
+
+        if not path.exists():
+            data = dict(DEFAULTS)
+        else:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("state.json must contain an object")
+                data = self._normalize(raw)
+            except Exception:
+                quarantined = self._quarantine(path)
+                data = dict(DEFAULTS)
+                data["_recovered_from"] = str(quarantined) if quarantined else None
+
+        with self._lock:
+            self._cache = _CacheEntry(stamp=self._stamp(path), data=dict(data))
+        return dict(data)
+
+    def _normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Coerce persisted values, repairing invalid entries to their default."""
+        data = dict(DEFAULTS)
+        for key, spec in REGISTRY.items():
+            if key not in raw:
+                continue
+            value = raw[key]
+            if key == "enabled_tools":
+                data[key] = migrate_enabled_tools(value)
+                continue
+            try:
+                data[key] = coerce(key, value)
+            except SettingsError:
+                data[key] = spec.default
+        data[_SCHEMA_KEY] = SCHEMA_VERSION
+        return apply_invariants(data)
+
+    # -- write ------------------------------------------------------------
+    def save(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        path = self.path
+        payload = {key: value for key, value in data.items() if not key.startswith("_")}
+        payload = apply_invariants(payload)
+        payload[_SCHEMA_KEY] = SCHEMA_VERSION
+        with _file_lock(path):
+            atomic_write_private(path, json.dumps(payload, indent=2))
+        with self._lock:
+            self._cache = _CacheEntry(stamp=self._stamp(path), data=dict(payload))
+        return dict(payload)
+
+    def update(self, **changes: Any) -> Dict[str, Any]:
+        """Read-modify-write one or more settings under a single lock."""
+        path = self.path
+        with _file_lock(path):
+            data = self.load()
+            for name, value in changes.items():
+                key = resolve_key(name)
+                spec = REGISTRY[key]
+                if not spec.mutable:
+                    raise SettingsError(f"'{key}' is read-only.")
+                data[key] = coerce(key, value)
+            payload = {k: v for k, v in data.items() if not k.startswith("_")}
+            payload = apply_invariants(payload)
+            payload[_SCHEMA_KEY] = SCHEMA_VERSION
+            atomic_write_private(path, json.dumps(payload, indent=2))
+        with self._lock:
+            self._cache = _CacheEntry(stamp=self._stamp(path), data=dict(payload))
+        return dict(payload)
+
+    # -- typed API --------------------------------------------------------
+    def get(self, name: str) -> Any:
+        return self.load().get(resolve_key(name))
+
+    def set(self, name: str, value: Any) -> Dict[str, Any]:
+        return self.update(**{resolve_key(name): value})
+
+    def reset(self, name: str) -> Dict[str, Any]:
+        key = resolve_key(name)
+        return self.update(**{key: REGISTRY[key].default})
+
+    def reset_all(self) -> Dict[str, Any]:
+        return self.save(dict(DEFAULTS))
+
+
+STORE = SettingsStore()
+
+
+def describe(name: str) -> Dict[str, Any]:
+    """Schema entry plus effective value — the payload behind `settings explain`."""
+    spec = spec_for(name)
+    return {
+        "key": spec.key,
+        "type": spec.type,
+        "group": spec.group,
+        "default": spec.default,
+        "value": "***" if spec.sensitive else STORE.get(spec.key),
+        "choices": spec.choice_list(),
+        "minimum": spec.minimum,
+        "maximum": spec.maximum,
+        "aliases": list(spec.aliases),
+        "description": spec.description,
+        "mutable": spec.mutable,
+        "restart_required": spec.restart_required,
+        "security_impact": spec.security_impact,
+        "sensitive": spec.sensitive,
+    }
+
+
+def schema() -> List[Dict[str, Any]]:
+    """Full machine-readable schema, ordered deterministically by group then key."""
+    return [describe(key) for key in sorted(REGISTRY, key=lambda k: (REGISTRY[k].group, k))]

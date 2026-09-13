@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "product": "AILinux App",
+  "identity": {
+    "account": "TriForce authenticated user",
+    "endpoint": "stable device endpoint",
+    "handle": "@username-style notify-network handle"
+  },
+  "api": {
+    "base": "https://api.ailinux.me",
+    "login": "/v1/auth/login",
+    "browser_exchange": "/v1/auth/browser/exchange",
+    "models": "/v1/client/models",
+    "chat": "/v1/client/chat",
+    "network": "/v1/notify-network",
+    "mcp": "/v1/mcp"
+  },
+  "sharing": {
+    "workspace_transport": "/v1/mcp/node/connect",
+    "presence_transport": "/v1/notify-network",
+    "handle_is_endpoint_address": true
+  }
+}

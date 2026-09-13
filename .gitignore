@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+!.env.example
+.gradle/
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+.workspacebackup/
+.DS_Store
+# locally generated integration binaries
+core/aicoder/aicoder-sidecar.spec
+apps/helper/apps/desktop/sidecar/aicoder-sidecar
+apps/helper/apps/desktop/sidecar/aicoder-sidecar.exe

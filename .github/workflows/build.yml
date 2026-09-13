@@ -1,0 +1,213 @@
+name: AILinux App
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ailinux-app-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '22'
+
+jobs:
+  contracts:
+    name: Contracts / core
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate shared contracts and AICoder source
+        run: |
+          python -m compileall -q core/aicoder/aicoder
+          python -m unittest -v tests.test_unified_contract
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/helper/apps/desktop/package-lock.json
+      - name: Validate Helper / desktop capability host
+        working-directory: apps/helper/apps/desktop
+        run: |
+          npm ci --ignore-scripts
+          npm run check
+
+  desktop:
+    name: Desktop ${{ matrix.name }}
+    needs: contracts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+            script: dist:linux
+          - os: windows-2025
+            name: windows
+            script: dist:win
+          - os: macos-15
+            name: macos
+            script: dist:mac
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: core/aicoder/pyproject.toml
+      - name: Install AICoder runtime builder
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip setuptools wheel pyinstaller
+          python -m pip install -e core/aicoder
+      - name: Build bundled AICoder sidecar
+        run: python scripts/build_sidecar.py
+      - name: Verify sidecar exists
+        shell: bash
+        run: |
+          ls -lah apps/helper/apps/desktop/sidecar
+          test -n "$(find apps/helper/apps/desktop/sidecar -maxdepth 1 -type f -name 'aicoder-sidecar*' -size +1M -print -quit)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/helper/apps/desktop/package-lock.json
+      - name: Install desktop dependencies
+        working-directory: apps/helper/apps/desktop
+        run: npm ci
+      - name: Test desktop host
+        working-directory: apps/helper/apps/desktop
+        run: npm run check
+      - name: Build unified desktop package
+        working-directory: apps/helper/apps/desktop
+        run: npm run ${{ matrix.script }} -- --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ailinux-app-${{ matrix.name }}
+          path: |
+            apps/helper/apps/desktop/dist/*.AppImage
+            apps/helper/apps/desktop/dist/*.deb
+            apps/helper/apps/desktop/dist/*.exe
+            apps/helper/apps/desktop/dist/*.dmg
+            apps/helper/apps/desktop/dist/*.zip
+          if-no-files-found: error
+
+  android:
+    name: Android
+    needs: contracts
+    runs-on: ubuntu-24.04
+    env:
+      AILINUX_ANDROID_KEYSTORE_B64: ${{ secrets.AILINUX_ANDROID_KEYSTORE_B64 }}
+      AILINUX_ANDROID_STORE_PASSWORD: ${{ secrets.AILINUX_ANDROID_STORE_PASSWORD }}
+      AILINUX_ANDROID_KEY_ALIAS: ${{ secrets.AILINUX_ANDROID_KEY_ALIAS }}
+      AILINUX_ANDROID_KEY_PASSWORD: ${{ secrets.AILINUX_ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile and test unified Android app
+        working-directory: apps/helper/apps/android
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Upload CI debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ailinux-app-android-debug
+          path: apps/helper/apps/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - name: Detect trusted production signing
+        id: signing
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if [[ -n "$AILINUX_ANDROID_KEYSTORE_B64" && -n "$AILINUX_ANDROID_STORE_PASSWORD" && -n "$AILINUX_ANDROID_KEY_PASSWORD" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Configure Android signing
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
+        shell: bash
+        run: printf '%s' "$AILINUX_ANDROID_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/ailinux-release.jks"
+      - name: Build production-signed APK
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
+        working-directory: apps/helper/apps/android
+        env:
+          AILINUX_ANDROID_KEYSTORE: ${{ runner.temp }}/ailinux-release.jks
+        run: ./gradlew --no-daemon :app:assembleRelease
+      - name: Stage signed APK
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          cp apps/helper/apps/android/app/build/outputs/apk/release/app-release.apk "AILinux-App-${GITHUB_REF_NAME#v}-android.apk"
+          sha256sum "AILinux-App-${GITHUB_REF_NAME#v}-android.apk" > SHA256SUMS-android.txt
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
+        with:
+          name: ailinux-app-android-release
+          path: |
+            AILinux-App-*-android.apk
+            SHA256SUMS-android.txt
+
+  termux:
+    name: Android Termux runtime
+    needs: contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build versioned AICoder Termux source bundle
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          stage="$RUNNER_TEMP/ailinux-app-termux-$version"
+          mkdir -p "$stage"
+          cp -a core/aicoder/aicoder core/aicoder/aicoder_main.py core/aicoder/pyproject.toml core/aicoder/packaging/termux "$stage/"
+          cp LICENSE README.md "$stage/"
+          tar -C "$RUNNER_TEMP" -czf "AILinux-App-$version-termux.tar.gz" "$(basename "$stage")"
+          sha256sum "AILinux-App-$version-termux.tar.gz" > SHA256SUMS-termux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ailinux-app-termux
+          path: |
+            AILinux-App-*-termux.tar.gz
+            SHA256SUMS-termux.txt
+
+  release:
+    name: Publish alpha release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, android, termux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Inventory release assets
+        run: find artifacts -maxdepth 2 -type f -printf '%P\n' | sort
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mapfile -t files < <(find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.apk' -o -name '*termux.tar.gz' -o -name 'SHA256SUMS-*.txt' \) | sort)
+          ((${#files[@]}))
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --title "AILinux App ${GITHUB_REF_NAME#v}" --notes "Unified AICoder + AILinux Helper alpha for Android, Linux, Windows and macOS."
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber

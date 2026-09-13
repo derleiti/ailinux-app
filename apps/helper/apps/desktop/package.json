@@ -1,0 +1,107 @@
+{
+  "name": "@ailinux/app-desktop",
+  "version": "3.0.0-alpha.1",
+  "private": true,
+  "description": "Unified AILinux App: AICoder + Helper capability host for Linux, Windows and macOS",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check main.js && node --test test/*.test.js",
+    "dist": "electron-builder",
+    "dist:linux": "electron-builder --linux AppImage deb",
+    "dist:win": "electron-builder --win nsis portable",
+    "dist:mac": "electron-builder --mac dmg zip"
+  },
+  "devDependencies": {
+    "electron": "44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "productName": "AILinux App",
+  "build": {
+    "appId": "me.ailinux.helper.desktop",
+    "productName": "AILinux App",
+    "artifactName": "AILinux-App-${version}-${os}-${arch}.${ext}",
+    "files": [
+      "main.js",
+      "preload.js",
+      "shell_backends.js",
+      "docker_runtime.js",
+      "service_runtime.js",
+      "design-tokens.json",
+      "aicoder_runtime.js",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "../../assets/desktop"
+    },
+    "protocols": [
+      {
+        "name": "AILinux App",
+        "schemes": [
+          "ailinux-helper",
+          "ailinux-workspace"
+        ]
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development",
+      "synopsis": "AILinux unified AI, coding and device capability app",
+      "maintainer": "AILinux <admin@ailinux.me>",
+      "icon": "../../assets/desktop/icon.png",
+      "syncDesktopName": true
+    },
+    "deb": {
+      "priority": "optional"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "../../assets/desktop/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "../../assets/desktop/icon-macos-1024.png"
+    },
+    "extraResources": [
+      {
+        "from": "../../assets/desktop/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "sidecar",
+        "to": "aicoder",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "executableName": "ailinux-app"
+  },
+  "author": {
+    "name": "AILinux",
+    "email": "admin@ailinux.me"
+  },
+  "homepage": "https://ailinux.me",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/derleiti/ailinux-app.git"
+  },
+  "desktopName": "ailinux-app.desktop"
+}

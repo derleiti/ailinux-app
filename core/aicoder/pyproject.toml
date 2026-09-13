@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=84.0.0", "wheel>=0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicoder"
+version = "1.2.6"
+description = "Terminalbasierter Coding-Agent für AILinux / TriForce Backend"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "rich>=15.0.0",
+  "typer>=0.27.2",
+  "PyQt6>=6.11.0",
+  "certifi>=2026.7.22",
+  "urllib3>=2.7.0",
+  "markdown>=3.10.3",
+  "prompt-toolkit>=3.0.53",
+  "pyte>=0.8.2",
+  "websockets>=16.1.1",
+  "keyring>=25.7.0",
+  "huggingface_hub>=0.35.0",
+  "tomli>=2.1.0; python_version < '3.11'",
+]
+
+[project.scripts]
+aicoder = "aicoder.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aicoder*"]
+
+[tool.setuptools.package-data]
+"aicoder.gui" = ["design_tokens.json"]
