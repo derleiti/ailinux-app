@@ -206,7 +206,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          mapfile -t files < <(find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.apk' -o -name '*termux.tar.gz' -o -name 'SHA256SUMS-*.txt' \) | sort)
+          mapfile -t files < <(find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name 'AILinux-App-*-android.apk' -o -name '*termux.tar.gz' -o -name 'SHA256SUMS-*.txt' \) | sort)
           ((${#files[@]}))
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --title "AILinux App ${GITHUB_REF_NAME#v}" --notes "Unified AICoder + AILinux Helper alpha for Android, Linux, Windows and macOS."
