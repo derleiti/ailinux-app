@@ -24,3 +24,6 @@ local.properties
 core/aicoder/aicoder-sidecar.spec
 apps/helper/apps/desktop/sidecar/aicoder-sidecar
 apps/helper/apps/desktop/sidecar/aicoder-sidecar.exe
+
+# editable source runtime metadata
+core/aicoder/*.egg-info/
