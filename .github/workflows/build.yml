@@ -38,7 +38,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel pytest
           python -m pip install -e upstream/aicoder
           python -m compileall -q upstream/aicoder/aicoder
-          QT_QPA_PLATFORM=offscreen python -m pytest -q upstream/aicoder/tests/test_helper_control.py
+          (cd upstream/aicoder && QT_QPA_PLATFORM=offscreen python -m pytest -q tests/test_helper_control.py)
           python -m unittest -v tests.test_unified_contract
       - uses: actions/setup-node@v4
         with:
