@@ -1,6 +1,6 @@
 # AILinux App
 
-**3.0.0 alpha 2** — the unified AILinux client built from **AICoder + AILinux Helper**.
+**3.0.0 alpha 3** — the unified AILinux client built from **AICoder + AILinux Helper**.
 
 One installation combines AI/coding, authenticated AILinux access, the `@handle` AI network, MCP/workspace sharing and device capabilities across Android, Linux, Windows and macOS.
 
@@ -35,12 +35,13 @@ Session material is encrypted using Android Keystore AES-GCM.
 
 ## Desktop
 
-Linux, Windows and macOS packages use the existing Electron Helper capability host and bundle AICoder as an internal `aicoder-sidecar` executable. The tray can open both the workspace/device host and the bundled AICoder GUI from the same installed product.
+Linux, Windows and macOS builds now compose **AICoder as the primary executable** with **AILinux Helper as an independent companion package**. The AICoder tray starts or opens Helper on demand; Helper keeps its own process lifecycle and package identity.
 
 ## Repository layout
 
 ```text
-core/aicoder/                 imported AICoder Python runtime
+upstream/aicoder/             Git submodule: primary AICoder application
+upstream/helper/              Git submodule: independent Helper companion
 apps/helper/apps/android/     unified native Android app + Helper executor
 apps/helper/apps/desktop/     unified Electron capability host
 apps/helper/apps/ios/         iOS design target
@@ -60,12 +61,12 @@ cd /home/zombie/ailinux-app
 ./run-source.sh
 ```
 
-`./run-source.sh --check` validates the local Python/Electron runtime. The installed KDE/Plasma launcher uses the same source entry point and includes actions for the source terminal, source folder and GitHub repository. In source mode the Electron capability host launches `core/aicoder/aicoder_main.py` directly when no packaged AICoder sidecar is present.
+`./run-source.sh --check` validates the composed runtime. The installed KDE/Plasma launcher starts **AICoder as the primary application**. The independent AILinux Helper is discovered through `AILINUX_HELPER_ROOT` and can be started/opened from the AICoder tray menu. The composer pins both upstream repositories through Git submodules plus `upstreams.lock.json`.
 
 ## Local verification
 
 ```bash
-python3 -m compileall -q core/aicoder/aicoder
+python3 -m compileall -q upstream/aicoder/aicoder
 python3 -m unittest -v tests.test_unified_contract
 
 cd apps/helper/apps/desktop
@@ -93,3 +94,7 @@ Sharing remains opt-in and capability-scoped. Logging into the AILinux account d
 ## License
 
 AILinux-authored material in this integration repository uses the AILinux Proprietary Source License. Imported historical code retains any rights already granted for its historical versions; third-party components retain their own licenses.
+
+## Composition model
+
+AILinux App is a composer rather than a source fork. `upstream/aicoder` and `upstream/helper` are Git submodules pinned by `upstreams.lock.json`. AICoder is the primary desktop app and owns the main tray. AILinux Helper remains independently installable/runnable and is launched on demand from AICoder. Android uses the composed native shell and installs the current AICoder runtime directly from `derleiti/ai-coder` inside Termux.

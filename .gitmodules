@@ -1,0 +1,6 @@
+[submodule "upstream/aicoder"]
+	path = upstream/aicoder
+	url = https://github.com/derleiti/ai-coder.git
+[submodule "upstream/helper"]
+	path = upstream/helper
+	url = https://github.com/derleiti/ailinux-helper.git

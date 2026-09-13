@@ -21,24 +21,32 @@ env:
 
 jobs:
   contracts:
-    name: Contracts / core
+    name: Composer / contracts
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Validate shared contracts and AICoder source
+          cache: pip
+          cache-dependency-path: upstream/aicoder/pyproject.toml
+      - name: Validate pinned upstreams and AICoder primary
         run: |
-          python -m compileall -q core/aicoder/aicoder
+          python scripts/validate_upstreams.py
+          python -m pip install --upgrade pip setuptools wheel pytest
+          python -m pip install -e upstream/aicoder
+          python -m compileall -q upstream/aicoder/aicoder
+          QT_QPA_PLATFORM=offscreen python -m pytest -q upstream/aicoder/tests/test_helper_control.py
           python -m unittest -v tests.test_unified_contract
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: apps/helper/apps/desktop/package-lock.json
-      - name: Validate Helper / desktop capability host
-        working-directory: apps/helper/apps/desktop
+          cache-dependency-path: upstream/helper/apps/desktop/package-lock.json
+      - name: Validate independent Helper
+        working-directory: upstream/helper/apps/desktop
         run: |
           npm ci --ignore-scripts
           npm run check
@@ -52,58 +60,54 @@ jobs:
         include:
           - os: ubuntu-24.04
             name: linux
-            script: dist:linux
+            helper_script: dist:linux
           - os: windows-2025
             name: windows
-            script: dist:win
+            helper_script: dist:win
           - os: macos-15
             name: macos
-            script: dist:mac
+            helper_script: dist:mac
     runs-on: ${{ matrix.os }}
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: core/aicoder/pyproject.toml
-      - name: Install AICoder runtime builder
+          cache-dependency-path: upstream/aicoder/pyproject.toml
+      - name: Build AICoder primary application
         shell: bash
         run: |
           python -m pip install --upgrade pip setuptools wheel pyinstaller
-          python -m pip install -e core/aicoder
-      - name: Build bundled AICoder sidecar
-        run: python scripts/build_sidecar.py
-      - name: Verify sidecar exists
-        shell: bash
-        run: |
-          ls -lah apps/helper/apps/desktop/sidecar
-          test -n "$(find apps/helper/apps/desktop/sidecar -maxdepth 1 -type f -name 'aicoder-sidecar*' -size +1M -print -quit)"
+          python -m pip install -e upstream/aicoder
+          python scripts/build_aicoder_primary.py
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: apps/helper/apps/desktop/package-lock.json
-      - name: Install desktop dependencies
-        working-directory: apps/helper/apps/desktop
-        run: npm ci
-      - name: Test desktop host
-        working-directory: apps/helper/apps/desktop
-        run: npm run check
-      - name: Build unified desktop package
-        working-directory: apps/helper/apps/desktop
-        run: npm run ${{ matrix.script }} -- --publish never
+          cache-dependency-path: upstream/helper/apps/desktop/package-lock.json
+      - name: Build independent AILinux Helper
+        working-directory: upstream/helper/apps/desktop
+        run: |
+          npm ci
+          npm run check
+          npm run ${{ matrix.helper_script }} -- --publish never
+      - name: Compose AILinux App desktop bundle
+        run: python scripts/stage_desktop_bundle.py ${{ matrix.name }}
       - uses: actions/upload-artifact@v4
         with:
           name: ailinux-app-${{ matrix.name }}
           path: |
-            apps/helper/apps/desktop/dist/*.AppImage
-            apps/helper/apps/desktop/dist/*.deb
-            apps/helper/apps/desktop/dist/*.exe
-            apps/helper/apps/desktop/dist/*.dmg
-            apps/helper/apps/desktop/dist/*.zip
+            build/AILinux-App-*-bundle.zip
+            upstream/helper/apps/desktop/dist/*.AppImage
+            upstream/helper/apps/desktop/dist/*.deb
+            upstream/helper/apps/desktop/dist/*.exe
+            upstream/helper/apps/desktop/dist/*.dmg
+            upstream/helper/apps/desktop/dist/*.zip
           if-no-files-found: error
 
   android:
@@ -117,6 +121,8 @@ jobs:
       AILINUX_ANDROID_KEY_PASSWORD: ${{ secrets.AILINUX_ANDROID_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -167,19 +173,21 @@ jobs:
             SHA256SUMS-android.txt
 
   termux:
-    name: Android Termux runtime
+    name: Android Termux / AICoder
     needs: contracts
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Build versioned AICoder Termux source bundle
         shell: bash
         run: |
           version=$(cat VERSION)
           stage="$RUNNER_TEMP/ailinux-app-termux-$version"
           mkdir -p "$stage"
-          cp -a core/aicoder/aicoder core/aicoder/aicoder_main.py core/aicoder/pyproject.toml core/aicoder/packaging/termux "$stage/"
-          cp LICENSE README.md "$stage/"
+          cp -a upstream/aicoder/aicoder upstream/aicoder/aicoder_main.py upstream/aicoder/pyproject.toml upstream/aicoder/packaging/termux "$stage/"
+          cp LICENSE README.md upstreams.lock.json "$stage/"
           tar -C "$RUNNER_TEMP" -czf "AILinux-App-$version-termux.tar.gz" "$(basename "$stage")"
           sha256sum "AILinux-App-$version-termux.tar.gz" > SHA256SUMS-termux.txt
       - uses: actions/upload-artifact@v4
@@ -190,7 +198,7 @@ jobs:
             SHA256SUMS-termux.txt
 
   release:
-    name: Publish alpha release
+    name: Publish composed release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [desktop, android, termux]
     runs-on: ubuntu-24.04
@@ -209,5 +217,5 @@ jobs:
           mapfile -t files < <(find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name 'AILinux-App-*-android.apk' -o -name '*termux.tar.gz' -o -name 'SHA256SUMS-*.txt' \) | sort)
           ((${#files[@]}))
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --title "AILinux App ${GITHUB_REF_NAME#v}" --notes "Unified AICoder + AILinux Helper alpha for Android, Linux, Windows and macOS."
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --title "AILinux App ${GITHUB_REF_NAME#v}" --notes "AICoder is the primary application. AILinux Helper remains an independent companion launched from the AICoder tray. Desktop bundles are composed from pinned AICoder and Helper repositories."
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber

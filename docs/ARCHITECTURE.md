@@ -1,5 +1,14 @@
 # AILinux App architecture
 
+## Composition model
+
+- **AICoder is the primary application.** Desktop launchers start AICoder first.
+- **AILinux Helper is an independent companion process.** It keeps its own repository, package identity, tray and lifecycle.
+- **AILinux App is the composer.** It pins `derleiti/ai-coder` and `derleiti/ailinux-helper` as Git submodules and records exact revisions in `upstreams.lock.json`.
+- AICoder's tray can start/open Helper. AICoder only stops Helper when it owns that exact child process; an already-running independent Helper is never killed.
+- Android remains a composed native client; its full AICoder Python runtime is installed from the AICoder repository and executed through Termux.
+
+
 ## One product, platform-specific execution
 
 AILinux App merges AICoder and AILinux Helper at the product and capability-contract layer without pretending that Android, Windows and Linux have identical process models.

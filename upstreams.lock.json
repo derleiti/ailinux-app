@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "generated_from": {
+    "aicoder": {
+      "repository": "https://github.com/derleiti/ai-coder.git",
+      "path": "upstream/aicoder",
+      "ref": "c79dd24151bbbb315a07931c6f0f7eb60007bd1b",
+      "role": "primary application and tray"
+    },
+    "helper": {
+      "repository": "https://github.com/derleiti/ailinux-helper.git",
+      "path": "upstream/helper",
+      "ref": "4fd29ac089c71c820347445f8ac337ba68104453",
+      "role": "independent device capability companion"
+    }
+  }
+}
