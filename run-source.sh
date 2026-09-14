@@ -20,6 +20,17 @@ fi
 export AILINUX_APP_SOURCE_ROOT="$ROOT"
 export AILINUX_HELPER_ROOT="${AILINUX_HELPER_ROOT:-$HELPER}"
 
+case "${1:-}" in
+  ailinux-helper://*|ailinux-workspace://*)
+    HELPER_DESKTOP="$HELPER/apps/desktop"
+    if [[ ! -d "$HELPER_DESKTOP/node_modules/electron" ]]; then
+      "$ROOT/scripts/setup-source.sh"
+    fi
+    cd "$HELPER_DESKTOP"
+    exec "$HELPER_DESKTOP/node_modules/.bin/electron" . "$1"
+    ;;
+esac
+
 if [[ "${1:-}" == "--check" ]]; then
   printf 'AILinux App composer root: %s\n' "$ROOT"
   printf 'Version: %s\n' "$(cat "$ROOT/VERSION")"
@@ -39,7 +50,13 @@ PY
   exit 0
 fi
 
-if [[ ! -x "$ROOT/.venv/bin/python" || ! -d "$HELPER/apps/desktop/node_modules/electron" ]]; then
+runtime_ready() {
+  [[ -x "$ROOT/.venv/bin/python" ]] || return 1
+  "$ROOT/.venv/bin/python" -c 'import aicoder, keyring, PyQt6' >/dev/null 2>&1 || return 1
+  [[ -x "$HELPER/apps/desktop/node_modules/.bin/electron" ]] || return 1
+}
+
+if ! runtime_ready; then
   "$ROOT/scripts/setup-source.sh"
 fi
 
