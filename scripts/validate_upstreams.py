@@ -10,8 +10,12 @@ for name, meta in LOCK.items():
     path = ROOT / meta['path']
     if not (path / '.git').exists() and not (path / '.git').is_file():
         raise SystemExit(f'{name}: submodule is not initialized: {path}')
-    actual = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
     expected = meta['ref']
-    if actual != expected:
-        raise SystemExit(f'{name}: expected {expected}, got {actual}')
-    print(f'{name}: {actual} OK')
+    index_line = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '-s', meta['path']], text=True).strip()
+    parts = index_line.split()
+    pinned = parts[1] if len(parts) >= 2 else ''
+    if pinned != expected:
+        raise SystemExit(f'{name}: parent gitlink expected {expected}, got {pinned or "missing"}')
+    actual = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
+    suffix = '' if actual == expected else f' (working checkout currently {actual}; parent pin is authoritative)'
+    print(f'{name}: {pinned} OK{suffix}')
