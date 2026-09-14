@@ -2,8 +2,8 @@
 Type=Application
 Version=1.5
 Name=AILinux App
-GenericName=AI Coding and Capability Client
-Comment=AICoder + Helper + AI Network
+GenericName=AILinux Loom Compatibility Client
+Comment=Launch AILinux Loom with legacy AICoder compatibility fallback
 Exec=/home/zombie/workspace/ailinux-app/run-source.sh
 Path=/home/zombie/workspace/ailinux-app
 Icon=ailinux-app
@@ -13,7 +13,7 @@ StartupNotify=true
 StartupWMClass=AILinux App
 MimeType=x-scheme-handler/ailinux-helper;x-scheme-handler/ailinux-workspace;
 Actions=Terminal;Folder;GitHub;
-Keywords=AI;AICoder;MCP;Workspace;TriForce;Helper;
+Keywords=AI;Loom;AICoder;MCP;Workspace;TriForce;Helper;
 
 [Desktop Action Terminal]
 Name=Open Source Terminal

@@ -1,8 +1,8 @@
 # AILinux App
 
-**3.0.0 alpha 3** — the unified AILinux client built from **AICoder + AILinux Helper**.
+**3.0.0 alpha 3** — compatibility client for the unified **AILinux Loom** workstation.
 
-One installation combines AI/coding, authenticated AILinux access, the `@handle` AI network, MCP/workspace sharing and device capabilities across Android, Linux, Windows and macOS.
+AILinux Loom is now the preferred desktop shell. This repository keeps Android upgrade continuity and legacy composed AICoder + Helper desktop packaging while source launches hand off to the canonical Loom checkout when available.
 
 ## What is merged
 
@@ -33,9 +33,9 @@ The launcher now contains:
 
 Session material is encrypted using Android Keystore AES-GCM.
 
-## Desktop
+## Desktop compatibility
 
-Linux, Windows and macOS builds now compose **AICoder as the primary executable** with **AILinux Helper as an independent companion package**. The AICoder tray starts or opens Helper on demand; Helper keeps its own process lifecycle and package identity.
+For source installs, `run-source.sh` now starts **AILinux Loom** from `/home/zombie/workspace/ailinux-ai-suite` (override with `AILINUX_LOOM_ROOT`). Set `AILINUX_APP_LEGACY_AICODER=1` only to force the historical AICoder-primary compatibility path. Existing packaged Linux/Windows/macOS alpha artifacts remain compatibility packages until the Loom packaging matrix fully supersedes them.
 
 ## Repository layout
 
@@ -61,7 +61,7 @@ cd /home/zombie/workspace/ailinux-app
 ./run-source.sh
 ```
 
-`./run-source.sh --check` validates the composed runtime. The installed KDE/Plasma launcher starts **AICoder as the primary application**. The independent AILinux Helper is discovered through `AILINUX_HELPER_ROOT` and can be started/opened from the AICoder tray menu. The composer pins both upstream repositories through Git submodules plus `upstreams.lock.json`.
+`./run-source.sh --check` validates the compatibility runtime and reports whether Loom is available. The installed KDE/Plasma launcher starts **Loom as the preferred desktop application** when present; otherwise it falls back to the historical AICoder-primary path. The independent AILinux Helper remains available as a capability companion.
 
 ## Local verification
 
