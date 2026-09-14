@@ -99,7 +99,9 @@ jobs:
       - name: Compose AILinux App desktop bundle
         run: python scripts/stage_desktop_bundle.py ${{ matrix.name }}
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
+          retention-days: 1
           name: ailinux-app-${{ matrix.name }}
           path: |
             build/AILinux-App-*-bundle.zip
@@ -133,8 +135,10 @@ jobs:
         working-directory: apps/helper/apps/android
         run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
       - name: Upload CI debug APK
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ailinux-app-android-debug
           path: apps/helper/apps/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
@@ -167,6 +171,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
         with:
+          retention-days: 1
           name: ailinux-app-android-release
           path: |
             AILinux-App-*-android.apk
@@ -191,7 +196,9 @@ jobs:
           tar -C "$RUNNER_TEMP" -czf "AILinux-App-$version-termux.tar.gz" "$(basename "$stage")"
           sha256sum "AILinux-App-$version-termux.tar.gz" > SHA256SUMS-termux.txt
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
+          retention-days: 1
           name: ailinux-app-termux
           path: |
             AILinux-App-*-termux.tar.gz
