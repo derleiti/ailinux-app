@@ -26,7 +26,7 @@ class UnifiedAppContractTests(unittest.TestCase):
         main = (ANDROID / "app/src/main/java/me/ailinux/workspace/MainActivity.java").read_text()
         workspace = (ANDROID / "app/src/main/java/me/ailinux/workspace/WorkspaceActivity.java").read_text()
         self.assertIn("applicationId 'me.ailinux.workspace'", gradle)
-        self.assertIn("versionName '3.0.0-alpha.4'", gradle)
+        self.assertIn("versionName '3.0.0-alpha.5'", gradle)
         self.assertIn('android:label="AILinux App"', manifest)
         self.assertIn("Sign in with WordPress / password", main)
         self.assertIn("Continue with Google in browser", main)
