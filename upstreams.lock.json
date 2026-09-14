@@ -4,13 +4,13 @@
     "aicoder": {
       "repository": "https://github.com/derleiti/ai-coder.git",
       "path": "upstream/aicoder",
-      "ref": "34cc28a3e23301f94f3dfc7bf09a85963cf4c71b",
+      "ref": "ebdce1bfdc52f805721fbe3bdaa99bc1abd727d1",
       "role": "primary application and tray"
     },
     "helper": {
       "repository": "https://github.com/derleiti/ailinux-helper.git",
       "path": "upstream/helper",
-      "ref": "3a6e8cb687d60aa03da8e4b478aca17fb7df0995",
+      "ref": "8d4792f8be11b6008da4d2bed61f05572ea7c4e6",
       "role": "independent device capability companion"
     }
   }
