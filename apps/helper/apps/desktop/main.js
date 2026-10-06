@@ -8,6 +8,7 @@ const shellBackends = require('./shell_backends');
 const dockerRuntime = require('./docker_runtime');
 const serviceRuntime = require('./service_runtime');
 const aicoderRuntime = require('./aicoder_runtime');
+const bugReporter = require('./bug_reporter');
 
 const APP_NAME = 'AILinux App';
 const START_URL = 'https://api.ailinux.me/v1/mcp';
@@ -394,6 +395,16 @@ async function navigate(target) {
   showWindow();
 }
 
+function openBugReportWindow() {
+  const reportWindow = new BrowserWindow({
+    width: 620, height: 500, resizable: true, modal: Boolean(window), parent: window || undefined,
+    title: 'AILinux App · Report a problem', backgroundColor: NATIVE_BACKGROUND, autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, 'bug_report_preload.js'), nodeIntegration: false, contextIsolation: true, sandbox: true, devTools: false },
+  });
+  reportWindow.loadFile(path.join(__dirname, 'bug_report.html'));
+  return reportWindow;
+}
+
 function rebuildTrayMenu() {
   if (!tray) return;
   tray.setToolTip(`${APP_NAME} · ${PLATFORM_LABEL} · ${connectionState}`);
@@ -419,6 +430,7 @@ function rebuildTrayMenu() {
     { type: 'separator' },
     { label: 'Reconnect workspace', click: () => window?.webContents.reloadIgnoringCache() },
     { label: 'Open MCP URL in default browser', click: () => shell.openExternal(START_URL) },
+    { label: 'Report a problem…', click: openBugReportWindow },
     { type: 'separator' },
     { label: 'Quit AILinux App', click: () => { quitting = true; aicoderRuntime.stop(); app.quit(); } },
   ]));
@@ -428,6 +440,7 @@ function updateConnectionState(next) {
   const normalized = String(next || 'Unknown').replace(/\s+/g, ' ').trim().slice(0, 120);
   if (!normalized || normalized === connectionState) return;
   connectionState = normalized;
+  bugReporter.log('connection_state', { state: normalized });
   rebuildTrayMenu();
   const important = /connected|reconnected|offline|disconnected|lost|expired|reconnecting|suspended/i.test(normalized);
   if (important && normalized !== lastNotifiedState && Notification.isSupported()) {
@@ -560,6 +573,9 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     app.setName(APP_NAME);
+    bugReporter.configure({ app: APP_NAME, repo: 'ailinux-app', version: app.getVersion(), userData: app.getPath('userData'), channel: app.isPackaged ? 'release' : 'development' });
+    ipcMain.handle('ailinux:bug-report-submit', async (_event, message) => bugReporter.submitManual(message));
+    ipcMain.on('ailinux:bug-report-close', (event) => { try { BrowserWindow.fromWebContents(event.sender)?.close(); } catch {} });
     for (const protocol of PROTOCOLS) app.setAsDefaultProtocolClient(protocol);
     pendingDeepLink = targetFromArgv(process.argv) || pendingDeepLink;
     loadDeviceShare();

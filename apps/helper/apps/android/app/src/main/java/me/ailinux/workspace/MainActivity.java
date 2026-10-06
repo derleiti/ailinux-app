@@ -22,8 +22,8 @@ import java.util.*;
 public class MainActivity extends Activity {
     private static final String REDIRECT="https://api.ailinux.me/v1/auth/browser/app-callback/ailinux-client";
     private AppApiClient api; private SecureStore secrets; private SharedPreferences local; private StateStore workspaceState; private TermuxShell termux;
-    private TextView accountStatus,aiOutput,networkOutput,termuxOutput;private EditText email,password,prompt,handle,termuxCommand;private Spinner models;private ArrayList<String> modelIds=new ArrayList<>();
-    @Override public void onCreate(Bundle b){super.onCreate(b);api=new AppApiClient(this);secrets=new SecureStore(this);local=getSharedPreferences("ailinux_app",MODE_PRIVATE);workspaceState=new StateStore(this);termux=new TermuxShell(this,workspaceState);buildUi();handleIntent(getIntent());refreshAccount();}
+    private TextView accountStatus,aiOutput,networkOutput,termuxOutput,reportStatus;private EditText email,password,prompt,handle,termuxCommand,reportMessage;private Spinner models;private ArrayList<String> modelIds=new ArrayList<>();
+    @Override public void onCreate(Bundle b){super.onCreate(b);BugReporter.install(this);api=new AppApiClient(this);secrets=new SecureStore(this);local=getSharedPreferences("ailinux_app",MODE_PRIVATE);workspaceState=new StateStore(this);termux=new TermuxShell(this,workspaceState);buildUi();handleIntent(getIntent());refreshAccount();}
     @Override protected void onNewIntent(Intent i){super.onNewIntent(i);setIntent(i);handleIntent(i);}
     private TextView text(String s,int size,boolean bold){TextView v=new TextView(this);v.setText(s);v.setTextColor(Color.WHITE);v.setTextSize(size);if(bold)v.setTypeface(Typeface.DEFAULT,Typeface.BOLD);v.setPadding(0,7,0,7);return v;}
     private Button button(String s){Button b=new Button(this);b.setText(s);b.setAllCaps(false);return b;}
@@ -67,7 +67,16 @@ public class MainActivity extends Activity {
         root.addView(text("All canonical AICoder settings are rendered from the same registry contract used by desktop AICoder.",13,false));
         Button settings=button("AICoder settings");settings.setOnClickListener(v->startActivity(new Intent(this,SettingsActivity.class)));root.addView(settings);
         Button provider=button("Provider account runtimes / Termux");provider.setOnClickListener(v->showProviderInfo());root.addView(provider);
+
+        addDiagnosticsUi(root);
         setContentView(scroll);
+    }
+    private void addDiagnosticsUi(LinearLayout root){
+        heading(root,"Diagnostics");
+        TextView privacy=text("Crash and failed startup self-test reports contain only redacted AILinux App runtime diagnostics. Workspace files, clipboard, screen content and account passwords are never attached.",13,false);privacy.setTextColor(0xff8b949e);root.addView(privacy);
+        reportMessage=input("What happened? (optional)",false);reportMessage.setMinLines(2);reportMessage.setSingleLine(false);root.addView(reportMessage);
+        Button submit=button("Submit diagnostics");reportStatus=text("",13,false);root.addView(submit);root.addView(reportStatus);
+        submit.setOnClickListener(v->{submit.setEnabled(false);reportStatus.setText("Submitting redacted diagnostics…");BugReporter.submitManual(reportMessage.getText().toString().trim(),(ok,detail)->ui(()->{submit.setEnabled(true);reportStatus.setText(detail);if(ok)reportMessage.setText("");}));});
     }
     private void ui(Runnable r){runOnUiThread(r);}
     private void refreshAccount(){String label=api.loggedIn()?"Signed in: "+api.email()+" · "+api.name():"Not signed in";accountStatus.setText(label);if(api.loggedIn()&&handle.getText().toString().trim().isEmpty()){String base=api.email().split("@")[0].toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_-]","-");handle.setText(base+"-android");}}

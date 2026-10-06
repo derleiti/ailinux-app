@@ -17,6 +17,7 @@ public class WorkspaceService extends Service implements ProtocolClient.Listener
 
     @Override public void onCreate(){
         super.onCreate();
+        BugReporter.install(this);
         createChannel();
         client=new ProtocolClient(this,this);
         connectivityManager=getSystemService(ConnectivityManager.class);

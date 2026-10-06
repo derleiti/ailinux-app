@@ -29,7 +29,10 @@
       "service_runtime.js",
       "design-tokens.json",
       "aicoder_runtime.js",
-      "package.json"
+      "package.json",
+      "bug_reporter.js",
+      "bug_report_preload.js",
+      "bug_report.html"
     ],
     "directories": {
       "output": "dist",
