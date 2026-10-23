@@ -4,7 +4,7 @@
     "aicoder": {
       "repository": "https://github.com/derleiti/ai-coder.git",
       "path": "upstream/aicoder",
-      "ref": "d07261b520af73ffc72689c97a112c3de29b7599",
+      "ref": "6ee1236192289f1e125abbbf7eff77389e51d0dd",
       "role": "primary application and tray"
     },
     "helper": {
